@@ -1,6 +1,6 @@
 # Quest Terminal
 
-A terminal for Meta Quest (Q1–Q3) and other Android devices, built around
+A terminal for Meta Quest (Q1–Q3) and Other meta quest devices, built around
 Shizuku/ByteZuku so it gets a real **uid 2000 shell** without root.
 
 There is no Gradle. `build.ps1` drives the raw SDK toolchain directly:
@@ -17,26 +17,21 @@ than `Messenger`, because `Messenger` silently drops `Message.obj`.
 and your own `>>` continuation for multi-line blocks; `pwshstop` ends it.
 `pwsh <expr>` runs a one-shot.
 
-**Package manager.** `pkg install python` resolves dependencies from the Termux
+**Package manager.** `example: pkg install python` resolves dependencies from the Termux
 repo, verifies each package's SHA256, and extracts it — in the background, with
 `pkg status` showing progress and the real exit code.
 
 **APK installer.** `apkinstall` with the `pm` flags you already know from
 `adb install` (`-r`, `-g`, `-d`, `-t`, `--user`, …).
 
-**Things a Quest does differently**, which is most of the reason this exists:
-`screencap` returns a black frame, and implicit `android.settings.*` intents
-never arrive because vrshell's `AndroidIntentsRelayActivity` swallows them, so
-every settings target here is named by component.
-
 Type `help` in the app for the full list.
 
 ## Requirements
 
 - Shizuku or ByteZuku, running, with this app granted access
-- Android 10+ (API 29+)
+- Android 10+ (API 29+) (if your running the usual quest it should be already that)
 
-Root is optional. Everything works without it; `askforsu` requests it if you
+Root is optional. Most things works without it; `askforsu` requests it if you
 want ptrace and `/proc/<pid>/mem`.
 
 ## Building
@@ -69,11 +64,7 @@ The signed APK lands at `build\terminal.apk`.
 
 ### Signing
 
-Bring your own key. This repository does not contain one, and `.gitignore`
-excludes `*.keystore` so you cannot commit one by accident. If you change the
-key after installing, Android will refuse the update unless you uninstall
-first — the signature has to match.
-
+Bring your own key. This repository does not contain one. So if you want to build it from source, you will have to make one
 ## After installing
 
 If you update the app and commands start failing oddly, run:

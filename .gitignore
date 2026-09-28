@@ -1,0 +1,27 @@
+# build output, entirely regenerable by build.ps1
+build/
+
+# signing material - never commit these
+*.keystore
+*.jks
+*.p12
+*.pem
+*.key
+
+# apksigner leaves this beside the apk; it is a signature, not source
+*.idsig
+
+# local overrides
+local.properties
+.env
+signing.properties
+
+# this machine's SDK paths and keystore credentials, see build.ps1
+build-local.ps1
+
+# editors and OS cruft
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db

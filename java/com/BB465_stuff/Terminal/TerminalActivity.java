@@ -2348,6 +2348,7 @@ public class TerminalActivity extends Activity {
             return true;
         }
         if (verb.equals("su")) { doSu(arg, s); return true; }
+        if (verb.equals("askforsu") || verb.equals("asksu")) { doAskSu(s); return true; }
         if (verb.equals("info")) { append(infoText(s)); return true; }
         if (verb.equals("rootcheck")) { append(rootText()); return true; }
         if (verb.equals("adbhelp") || verb.equals("settings")) {
@@ -2628,29 +2629,214 @@ public class TerminalActivity extends Activity {
         });
     }
 
-    private void doSu(String arg, final Session s) {
-        final String probe = "if command -v su >/dev/null 2>&1; then "
-                          + "su -c 'id -u' 2>&1; else echo NOSU; fi";
+    /**
+     * Build the su probe.
+     *
+     * The thing that triggers the manager's prompt is the su binary itself, at
+     * whatever path it lives on - so each candidate is invoked by its own
+     * absolute path, not by hoping `su` is on $PATH. A device can have su at
+     * /product/bin/su with nothing named su on the PATH at all, so an earlier
+     * version that detected the path and then ran a bare `su` could find a
+     * binary and still ask the wrong one.
+     *
+     * Order is chosen by which daemon is actually running, because that is
+     * what tells us whose su is the live one:
+     *
+     *   magiskd   -> /product/bin/su and /system/bin/su. /product is a real
+     *                partition on modern Android and the stock su lives there,
+     *                with Magisk magic-mounting over it, so it is usually the
+     *                first hit rather than the legacy path it looks like.
+     *   ksud      -> /debug_ramdisk/su and /data/adb/ksu/bin/su, which is
+     *                where KernelSU puts it. Neither is on the normal PATH.
+     *   apd       -> APatch's own location.
+     *
+     * Everything else is still tried afterwards, in a fixed order, so an
+     * unrecognised manager or an unusual layout still gets found. The first
+     * candidate that answers 0 wins and stops the walk, because each attempt
+     * can block for the full timeout while the manager waits for the user -
+     * trying all of them at 30s each would be minutes of nothing.
+     */
+    private static String suProbe(int timeoutSec) {
+        return "BB=" + ShellService.BUSYBOX + "; "
+             + "try_su() { "
+             + "  _p=$1; "
+             + "  [ -e \"$_p\" ] || return 0; "
+             + "  if command -v timeout >/dev/null 2>&1; then "
+             + "    _o=$(timeout " + timeoutSec + " \"$_p\" -c 'id -u' 2>&1 | head -1); "
+             + "  else "
+             + "    _o=$(\"$_p\" -c 'id -u' 2>&1 | head -1); "
+             + "  fi; "
+             + "  echo \"ATT $_p :: $_o\"; "
+             + "  case \"$_o\" in 0*) exit 0;; esac; "
+             + "  return 0; "
+             + "}; "
+             + "M=; C=; "
+             + "if pidof magiskd >/dev/null 2>&1; then M=magisk; "
+             + "C=\"/product/bin/su /system/bin/su /system/xbin/su\"; fi; "
+             + "if pidof ksud >/dev/null 2>&1; then M=kernelsu; "
+             + "C=\"/debug_ramdisk/su /data/adb/ksu/bin/su $C\"; fi; "
+             + "if pidof apd >/dev/null 2>&1; then M=apatch; fi; "
+             + "[ -n \"$M\" ] && echo \"MGR $M\"; "
+             + "echo 'TRYBEGIN'; "
+             + "for p in $C /product/bin/su /system/bin/su /system/xbin/su "
+             + "/sbin/su /su/bin/su /debug_ramdisk/su /data/adb/ksu/bin/su "
+             + "/vendor/bin/su; do try_su \"$p\"; done; "
+             + "try_su \"$(command -v su 2>/dev/null)\"; "
+             + "echo 'TRYEND'";
+    }
+
+    private static final String SU_PROBE = suProbe(8);
+
+    /** results of parsing the probe output, so both entry points share the logic */
+    private static class SuResult {
+        String path;          // a su binary that exists
+        String manager;       // magisk / kernelsu / apatch, null if none
+        String said;          // what the winning su printed, "" if none did
+        int attempts = 0;     // how many candidates were actually run
+        boolean tried() { return !said.isEmpty(); }
+        boolean granted() { return said.trim().equals("0"); }
+        boolean present() { return path != null; }
+    }
+
+    private static SuResult parseSu(String o) {
+        SuResult r = new SuResult();
+        boolean inTry = false;
+        for (String line : (o == null ? "" : o).split("\\n")) {
+            String l = line.trim();
+            if (l.startsWith("MGR ")) { r.manager = l.substring(4).trim(); continue; }
+            if (l.equals("TRYBEGIN")) { inTry = true; continue; }
+            if (l.equals("TRYEND")) { inTry = false; continue; }
+            if (!inTry || !l.startsWith("ATT ")) continue;
+
+            // ATT <path> :: <reply>
+            String rest = l.substring(4);
+            int sep = rest.indexOf(" :: ");
+            if (sep < 0) continue;
+            String p = rest.substring(0, sep).trim();
+            String v = rest.substring(sep + 4).trim();
+            r.attempts++;
+            if (r.path == null && p.length() > 0) r.path = p;
+            // first non-empty reply wins; the script exits early on 0 anyway
+            if (r.said.isEmpty() && v.length() > 0) r.said = v;
+        }
+        return r;
+    }
+
+    /**
+     * askforsu: deliberately ask the root manager for root, and wait long
+     * enough for you to approve it.
+     *
+     * 'su -c <cmd>' is the Magisk protocol; KernelSU and APatch answer the
+     * same call, so this asks whichever su is present rather than Magisk
+     * specifically, and reports which manager it found.
+     *
+     * Two things this has to get right, both learned the hard way:
+     *
+     * 1. 'command -v su' only searches $PATH, and the managers do not all put
+     *    su there. Magisk magic-mounts it at /system/bin/su, older Magisk used
+     *    /system/xbin/su, KernelSU uses /debug_ramdisk/su and
+     *    /data/adb/ksu/bin/su, APatch has its own. Checking only the PATH
+     *    version called rooted devices unrooted, which is what it did on
+     *    someone else's phone. So the real locations are checked too.
+     *
+     * 2. su blocks while the manager waits for approval, and the normal exec
+     *    path has no timeout, so an unattended su would hang the terminal
+     *    forever. Hence 'timeout' - short for a plain check, long here.
+     */
+    private void doAskSu(Session s) {
         if (sh == null) { append("no shell\n"); return; }
-        sh.execRaw(probe, new Shell.Raw() {
+        append("asking for root...\n");
+        append("if a prompt appears in your root manager, approve it.\n");
+        s.busy = true;
+        sh.execRaw(suProbe(30), new Shell.Raw() {
             public void got(String o) {
-                String t = o == null ? "" : o.trim();
-                if (t.contains("NOSU")) {
-                    append("su: not available - this device has no root installed.\n"
-                         + "su lives at /product/bin/su and is created by Magisk.\n"
-                         + "Without it, uid 2000 cannot escalate: ptrace returns EPERM\n"
-                         + "under SELinux Enforcing and there is no other path.\n"
-                         + "Install Magisk and this same command will work.\n");
-                } else if (t.equals("0")) {
-                    append("su: granted, uid 0\n");
-                    // prompt glyph flips from $ to # for the rest of the tab
-                    s.uid = 0;
+                s.busy = false;
+                SuResult r = parseSu(o);
+                if (r.path == null && r.manager == null) {
+                    append("\nno root to ask - no su binary anywhere, and no root\n"
+                         + "manager daemon is running. nothing to request.\n");
+                    append("checked: /product/bin/su /system/bin/su\n"
+                         + "         /system/xbin/su /sbin/su /su/bin/su\n"
+                         + "         /debug_ramdisk/su /data/adb/ksu/bin/su\n"
+                         + "         /vendor/bin/su, and $PATH\n");
+                    append("         /product/bin/su is the stock location on\n"
+                         + "         most modern Androids, which Magisk\n"
+                         + "         magic-mounts over, so it is tried first.\n");
+                    append("\nnot a problem: this terminal runs through Shizuku\n"
+                         + "as uid 2000 either way.\n");
+                    appendPrompt();
+                    return;
+                }
+                if (r.manager != null) append("  manager: " + r.manager + "\n");
+                if (r.path != null) append("  su:     " + r.path + "\n");
+                if (r.granted()) {
+                    append("\nroot granted, uid 0\n");
+                    s.uid = 0;                 // prompt glyph flips $ to #
+                    appendPrompt();
+                    return;
+                }
+                append("\nroot refused\n");
+                if (!r.tried()) {
+                    append("  su said nothing for 30s. it is probably still\n"
+                         + "  waiting for you, so check the root manager for an\n"
+                         + "  unanswered prompt.\n");
+                } else {
+                    append("  it said: " + r.said + "\n");
+                    append("  allow shell access in the manager's superuser\n"
+                         + "  list, then run askforsu again.\n");
+                }
+                append("  the terminal is unaffected, still uid 2000.\n");
+                appendPrompt();
+            }
+        });
+    }
+
+    private void doSu(String arg, final Session s) {
+        if (sh == null) { append("no shell\n"); return; }
+        sh.execRaw(SU_PROBE, new Shell.Raw() {
+            public void got(String o) {
+                SuResult r = parseSu(o);
+                String uid = r.said;
+
+                // No root. This is not a problem to report, it is the normal
+                // case: everything in this app runs through Shizuku as uid
+                // 2000, and root was only ever a bonus.
+                if (r.path == null && r.manager == null) {
+                    append("no root on this device - no su, no root manager.\n");
+                    append("not a problem: everything here runs through\n"
+                         + "Shizuku as uid 2000. still working as normal.\n");
+                    append("\nroot would only add ptrace, /proc/<pid>/mem, and\n"
+                         + "writes outside the shared folders. 'askforsu' asks\n"
+                         + "properly and waits; 'rootcheck' lists where it looked.\n");
+                    return;
+                }
+
+                if (r.granted()) {
+                    append("root granted, uid 0\n");
+                    if (r.manager != null) append("  manager: " + r.manager + "\n");
+                    if (r.path != null) append("  su:     " + r.path + "\n");
+                    s.uid = 0;                 // prompt glyph flips $ to #
                     if (arg != null && arg.length() > 0) {
                         sh.exec("su -c " + q(arg));
                     }
-                } else {
-                    append("su: failed -> " + t + "\n");
+                    render();
+                    return;
                 }
+
+                // su exists but did not hand over uid 0
+                append("root found, not granted\n");
+                if (r.manager != null) append("  manager: " + r.manager + "\n");
+                if (r.path != null) append("  su:     " + r.path + "\n");
+                if (!r.tried()) {
+                    append("  it did not answer. it is probably waiting for you\n"
+                         + "  to approve it in the root manager - look there, or\n"
+                         + "  it timed out after 8s. 'askforsu' waits longer.\n");
+                } else {
+                    append("  it said: " + r.said + "\n");
+                    append("  grant shell access in the root manager's superuser\n"
+                         + "  list, then run askforsu again.\n");
+                }
+                append("  nothing else is affected; still on Shizuku uid 2000.\n");
                 render();
             }
         });
@@ -2679,8 +2865,21 @@ public class TerminalActivity extends Activity {
             + " echo uid=$(id -u);"
             + " echo busybox=$(" + ShellService.BUSYBOX + " 2>/dev/null | head -1);"
             + " echo selinux=$(getenforce 2>/dev/null || echo unknown);"
-            + " echo su=$([ -e /product/bin/su ] && echo present || echo absent);"
-            + " echo magisk=$(pidof magiskd 2>/dev/null || echo no);"
+            // Root detection looks everywhere the managers actually put su.
+            // Checking only /product/bin/su called rooted devices unrooted,
+            // because that is one Magisk-era path and no longer where any of
+            // them keep it.
+            // 'exit' here ends only the $( ) subshell, so the first match wins
+            // and the "absent" default still runs when nothing matched
+            + " echo su=$(for p in /system/bin/su /system/xbin/su /sbin/su"
+            + " /su/bin/su /debug_ramdisk/su /data/adb/ksu/bin/su"
+            + " /vendor/bin/su /product/bin/su; do"
+            + " if [ -e \"$p\" ]; then echo $p; exit 0; fi; done; echo absent);"
+            + " echo mgr=$(pidof magiskd >/dev/null 2>&1 && echo magisk"
+            + " || pidof ksud >/dev/null 2>&1 && echo kernelsu"
+            + " || pidof apd  >/dev/null 2>&1 && echo apatch"
+            + " || echo none);"
+            + " echo suworks=$(su -c 'id -u' 2>/dev/null | head -1);"
             + " echo adbport=$(getprop persist.adb.tcp.port);"
             + " echo installed=$(ls " + ShellService.PREFIX
             + " 2>/dev/null | tr '\\n' ' ')";
@@ -2713,13 +2912,23 @@ public class TerminalActivity extends Activity {
     }
 
     private String rootText() {
-        return "root check\n"
-             + "  /product/bin/su   " + f("su") + "\n"
-             + "  magiskd running   " + f("magisk") + "\n"
-             + "  selinux           " + f("selinux") + "\n"
-             + "  current uid       " + f("uid") + "\n"
-             + "\nuid 0 = full root. uid 2000 = shell (this app's ceiling).\n"
-             + "selinux permissive is what lets shell ptrace; enforcing blocks it.\n";
+        return "root\n"
+             + "  manager    " + f("mgr") + "\n"
+             + "  su         " + f("su") + "\n"
+             + "  su works   " + f("suworks") + "\n"
+             + "  uid now    " + f("uid") + "\n"
+             + "  selinux    " + f("selinux") + "\n"
+             + "\n"
+             + "root is optional here. everything runs through Shizuku as\n"
+             + "uid 2000; root would only add ptrace, /proc/<pid>/mem and\n"
+             + "writes outside the shared folders.\n"
+             + "\n"
+             + "su is invoked at each of those paths in turn, not just as a\n"
+             + "bare 'su', because the binary itself is what makes the manager\n"
+             + "show its prompt. /product/bin/su is the stock location on most\n"
+             + "modern Androids and Magisk magic-mounts over it, so it is\n"
+             + "tried first. Checking only $PATH reported rooted phones as\n"
+             + "unrooted, because su is not always on the PATH at all.\n";
     }
 
     /**
@@ -3547,7 +3756,11 @@ public class TerminalActivity extends Activity {
              + "  pref <name> [val] show or set one from the prompt\n"
              + "  color             list the colors, or: color <name> <RRGGBB>\n"
              + "                    names: bg ps fg prompt dim theme\n"
-             + "  rootcheck         su / magiskd / selinux state\n"
+             + "  rootcheck         root status: manager, su, whether it works\n"
+             + "  askforsu          ask the root manager for root and wait 30s.\n"
+             + "                    approve it in Magisk/KernelSU/APatch when the\n"
+             + "                    prompt appears. says granted, refused, or\n"
+             + "                    no root, and names the manager it found.\n"
              + "  adbd              adb daemon state on this device\n"
              + "  settings          open a Quest settings page (adbhelp lists targets)\n"
              + "  pkg install <p>   prebuilt Termux arm64 packages, with dependencies\n"
@@ -3568,7 +3781,7 @@ public class TerminalActivity extends Activity {
              + "  run <script>        run a script. .ps1 goes to PowerShell,\n"
              + "                      anything else to the shell. the path is\n"
              + "                      quoted, so spaces are fine\n"
-             + "  su <cmd>          run as root, if root exists\n\n"
+             + "  su <cmd>          run as root if there is root, else as shell\n\n"
              + "what is actually different on a Quest\n"
              + "  implicit android.settings.* intents never arrive - vrshell's\n"
              + "    AndroidIntentsRelayActivity swallows them, so every settings\n"

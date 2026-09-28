@@ -1,1 +1,3 @@
-all files in here will NOT be updated
+all files in here may NOT be updated to source
+
+ 

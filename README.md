@@ -10,7 +10,7 @@
   <a href="https://img.shields.io/github/issues/Banban465-tech/Quest-Terminal?style=flat&label=issues"><img src="https://img.shields.io/github/issues/Banban465-tech/Quest-Terminal?style=flat&label=issues" alt="issues"></a>
   <a href="https://img.shields.io/github/last-commit/Banban465-tech/Quest-Terminal?style=flat&label=last%20commit"><img src="https://img.shields.io/github/last-commit/Banban465-tech/Quest-Terminal?style=flat&label=last%20commit" alt="last commit"></a>
   <a href="https://img.shields.io/badge/gradle-none-3ddc84?style=flat&label=build"><img src="https://img.shields.io/badge/gradle-none-3ddc84?style=flat&label=build" alt="no gradle"></a>
-  <a href="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FBanban465-tech%2FQuest-Terminal%2Fmain%2Fstats.json&label=java&suffix=%20LOC&color=blue"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FBanban465-tech%2FQuest-Terminal%2Fmain%2Fstats.json&label=java&suffix=%20LOC&color=blue" alt="lines of java"></a>
+  <a href="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2FBanban465-tech%2FQuest-Terminal%2Fmain%2Fstats.json&query=lines&label=java&suffix=%20LOC&color=blue"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2FBanban465-tech%2FQuest-Terminal%2Fmain%2Fstats.json&query=lines&label=java&suffix=%20LOC&color=blue" alt="lines of java"></a>
 </p>
 
 A terminal for Meta Quest (Q1–Q3) and Other meta quest devices, built around

@@ -1,0 +1,60 @@
+name: stats
+
+# Recomputes stats.json and the stats table in README.md. The script only edits
+# what sits between the stats markers, so hand-written prose is never touched,
+# and running it on an unchanged tree produces no commit.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # 04:17 UTC daily. off the hour on purpose, GitHub queues the whole
+    # top-of-hour slot and these jobs are not urgent.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Never let two runs race to push the same block.
+concurrency:
+  group: stats
+  cancel-in-progress: true
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compute stats
+        run: python .github/scripts/update_stats.py
+
+      - name: Commit if anything changed
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md stats.json
+          if git diff --cached --quiet; then
+            echo "stats already current, nothing to commit"
+            exit 0
+          fi
+          git commit -m "chore: refresh stats [skip ci]"
+          # The branch may have moved while this ran, so rebase rather than
+          # clobber whatever landed in the meantime.
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "pushed on attempt $attempt"
+              exit 0
+            fi
+            echo "push rejected, rebasing and retrying ($attempt/3)"
+            sleep 5
+            git pull --rebase origin main
+          done
+          echo "could not push after 3 attempts, leaving it for the next run"
+          exit 0

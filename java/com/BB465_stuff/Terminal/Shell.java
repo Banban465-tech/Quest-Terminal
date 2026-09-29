@@ -14,20 +14,14 @@ import java.util.concurrent.atomic.AtomicInteger;
 import rikka.shizuku.Shizuku;
 
 /**
- * Client side of the Shizuku transport.
+ * Shizuku transport. Its UserService runs as uid 2000, the same identity adb
+ * shell gets, so no adb key is needed - which is why it is the default.
  *
- * Shizuku is the only viable transport here and that is not a preference:
- * adbd requires an RSA key we do not hold (ro.adb.secure=1) and, as it turns
- * out, refuses the app's key outright because the PC's key is only authorized
- * over the WIFI TLS transport, not plain TCP. Shizuku already runs as uid 2000,
- * so binding its UserService is what buys a real shell.
- *
- * The wire is a plain synchronous Parcel transact, not Messenger: Messenger
- * drops Message.obj, which is where the command line was being put. exec()
- * therefore blocks on its own thread and posts the result back to the UI, so
- * a slow command cannot ANR the activity.
+ * The wire is a synchronous Parcel transact, not Messenger: Messenger drops
+ * Message.obj, where the command line was being put. exec() therefore blocks on
+ * its own thread and posts back to the UI, so a slow command cannot ANR.
  */
-public class Shell {
+public class Shell implements Transport {
 
     public interface Callback {
         void onReady(Shell s);
@@ -113,10 +107,8 @@ public class Shell {
             cb.onFail("Shizuku/ByteZuku is not running - start it first");
             return;
         }
-        // The VR system recreates this activity now and then, and every onCreate
-        // called connect() again. That stacked a second polling chain and a
-        // second bind on top of the first, which double-ran the startup
-        // self-test and would have forked a second PowerShell session.
+        // The VR system recreates this activity on its own, and a second
+        // connect() would stack a second watcher and bind on top of the first.
         if (connecting || binding || pendingWatch != null) {
             Log.i("BBterm", "connect: already connecting, ignoring this one");
             return;
@@ -126,21 +118,14 @@ public class Shell {
         checkPermission(fctx, cb, 0);
     }
 
-    /**
-     * ByteZuku's checkSelfPermission flaps: the same install read 0 on one
-     * launch and -1 on the next, alternating. Trusting a single sample made
-     * every other launch bail out and pop the manager's prompt, which reset
-     * the grant again and made it worse. So poll it briefly before deciding.
-     */
+    // ByteZuku's checkSelfPermission flaps: the same install alternates between
+    // 0 and -1 across launches. Trusting one sample made every other launch bail
+    // out and pop the manager's prompt, which reset the grant and made it worse.
     private static final int PERM_TRIES = 5;
     private static final long PERM_DELAY = 350;
 
-    /**
-     * The fast burst is not enough. The manager's grant often lands seconds
-     * after our prompt, and before this watcher existed that meant closing and
-     * reopening the app by hand. Now we keep sampling in the background for a
-     * couple of minutes and bind the instant it flips to granted.
-     */
+    // A grant often lands seconds after the prompt, so keep sampling in the
+    // background for a few minutes and bind the moment it flips to granted.
     private static final long SLOW_DELAY = 2000;
     private static final int SLOW_TRIES = 90;          // ~3 minutes
     /** after a full miss, back off and try again rather than giving up for good */
@@ -195,12 +180,9 @@ public class Shell {
                     settleThenBind(ctx, cb);
                     return;
                 }
-                // Re-ask on a slow cadence while access is missing. Granting
-                // can be revoked by accident - a stray tap in the manager, an
-                // install, a manager restart - and a terminal that only ever
-                // asks once leaves the user with no shell and no explanation.
-                // Every 30s is often enough to be useful and rare enough not to
-                // be a nuisance.
+                // Re-ask on a slow cadence: a grant can be revoked by accident,
+                // and asking only once leaves the user with no shell and no way
+                // to see why. 30s is often enough and rare enough not to nag.
                 if (tick[0] % REASK_EVERY == 0) {
                     Log.i("BBterm", "watch: still denied at tick " + tick[0]
                             + ", asking again");
@@ -214,9 +196,7 @@ public class Shell {
                     connecting = false;
                     Log.i("BBterm", "watch: gave up after " + tick[0]
                             + " ticks, re-arming in " + (REARM_DELAY / 1000) + "s");
-                    // Do not just stop. A terminal that quietly stops trying is
-                    // worse than one that never tries, because it looks like
-                    // the app is broken. Re-arm until the grant shows up, so
+                    // Never just stop: re-arm until the grant shows up, so
                     // granting in the manager always heals on its own.
                     UI.postDelayed(new Runnable() {
                         public void run() { startWatch(ctx, cb); }
@@ -241,8 +221,8 @@ public class Shell {
         if (perm == android.content.pm.PackageManager.PERMISSION_GRANTED) {
             cancelWatch();
             // cancelWatch clears 'connecting', which is right for the polling
-            // phase but wrong here: we are about to bind, and the duplicate
-            // guard has to keep covering us until the binder actually lands.
+            // phase but wrong here: the duplicate guard must keep covering us
+            // until the binder actually lands.
             binding = true;
             settleThenBind(ctx, cb);
             return;
@@ -264,13 +244,9 @@ public class Shell {
     }
 
     /**
-     * Ask for access again, on demand.
-     *
-     * The once-per-process rule is right for not nagging on launch, but it left
-     * a real hole: dismiss the dialog once, or revoke the grant by accident,
-     * and the app never asked again - it just sat there looking authorised-ish
-     * with no shell. This is what the ACCESS button and 'checkshizuku' call, so
-     * one tap always produces a fresh prompt.
+     * The once-per-process rule avoids nagging on launch, but it left a hole:
+     * dismiss the dialog once, or lose the grant, and the app never asked
+     * again. This backs the ACCESS button and 'checkshizuku'.
      */
     public static void requestAgain(final Context ctx, final Callback cb) {
         askedThisProcess = false;
@@ -296,10 +272,9 @@ public class Shell {
     }
 
     /**
-     * Give the Shizuku provider a moment before asking it for a user service.
-     * Right after an install it is still coming up, and asking too early is
-     * what makes the manager answer with "unable to find token" and never send
-     * a binder. Half a second is enough and costs nothing when it works.
+     * Right after an install the provider is still coming up, and asking too
+     * early is what makes the manager answer "unable to find token" and never
+     * send a binder. Half a second is enough.
      */
     private static void settleThenBind(final Context ctx, final Callback cb) {
         UI.postDelayed(new Runnable() {
@@ -326,31 +301,24 @@ public class Shell {
                             UI.post(new Runnable() {
                                 public void run() { cb.onReady(shell); }
                             });
-                            // Prove the transport the moment it binds, so a
-                            // working shell is visible in logcat without anyone
-                            // having to type into a VR panel. One short command:
-                            // this used to also run a full PowerShell session on
-                            // every connect, which was only ever a development
-                            // check and left a pwsh process behind on every app
-                            // launch. 'pwshdemo' is the deliberate way to do that.
+                            // One short command so a working shell is visible in
+                            // logcat. 'pwshdemo' is the deliberate way to bring
+                            // up a full PowerShell session.
                             shell.execRaw("id; echo BBTERM_OK; echo $((6*7))",
                                     new Raw() {
                                         public void got(String s) {
                                             Log.i("BBterm", "selftest -> " + s);
                                         }
                                     });
-                            // Is this the build the app expects? A :bbterm from
-                            // an older install survives 'am force-stop' and the
-                            // Shizuku server keeps handing it back, so without
-                            // this the first sign of trouble is some unrelated
-                            // command failing much later with no explanation.
+                            // A :bbterm from an older install survives
+                            // 'am force-stop' and the Shizuku server hands it
+                            // back, so check the build now or an unrelated
+                            // command fails much later with no explanation.
                             shell.pingBuild(new Raw() {
                                 public void got(String build) {
-                                    // runAsync rewrites a "transact rejected"
-                                    // into its own message, so the reply here
-                                    // is not always a build string. Anything
-                                    // that is not our build exactly means the
-                                    // service is stale.
+                                    // runAsync rewrites a rejected transact into
+                                    // its own message, so a non-null reply is not
+                                    // always a build string.
                                     if (build == null || !ShellService.BUILD.equals(build)) {
                                         Log.w("BBterm", "service is not the"
                                                 + " expected build (got: " + build
@@ -372,10 +340,8 @@ public class Shell {
                                 public void run() { cb.onFail("the shell service"
                                         + " died, reconnecting..."); }
                             });
-                            // Being authorised is not the same as having a live
-                            // service. If the :bbterm process went away, a
-                            // terminal that only complains is useless, so put
-                            // the connection back on its own.
+                            // Authorised does not mean the service is alive, so
+                            // put the connection back on its own.
                             UI.postDelayed(new Runnable() {
                                 public void run() {
                                     if (shell.svc == null) connect(ctx, cb);
@@ -391,27 +357,22 @@ public class Shell {
         }
 
         // bindUserService is async and, when the manager is in a bad state,
-        // never calls back at all. The manager logs
-        //   IllegalArgumentException: unable to find token ...
-        // in that case and the service process just sits there with its binder
-        // undelivered, so the app would otherwise wait forever with no error
-        // and no shell. Treat a silent bind as a failure and try again.
+        // never calls back at all - it logs "unable to find token" and the
+        // binder is never delivered. Treat a silent bind as a failure.
         UI.postDelayed(new Runnable() {
             public void run() {
                 if (bound[0] || shell.svc != null) return;
                 Log.w("BBterm", "bind timed out, the manager never delivered a binder");
                 // A shell left half-built is worse than none: drop it so the
-                // retry starts from a clean state.
+                // retry starts clean.
                 connecting = false;
                 binding = false;
                 shell.svc = null;
                 if (retries < MAX_RETRIES) {
                     retries++;
-                    // Spread these out. Hammering bindUserService faster than
-                    // the manager can drain its queue makes it worse: its own
-                    // log fills with "unable to find token", because it is
-                    // being handed a request for a token it has already
-                    // discarded. A few seconds of patience is what works.
+                    // Space these out: hammering bindUserService faster than the
+                    // manager can drain its queue makes it worse, because each
+                    // request asks for a token it has already discarded.
                     long wait = 3000L * retries;
                     Log.i("BBterm", "rebind attempt " + retries + " of "
                             + MAX_RETRIES + " in " + (wait / 1000) + "s");
@@ -419,13 +380,9 @@ public class Shell {
                         public void run() { connect(ctx, cb); }
                     }, wait);
                 } else {
-                    // The manager has genuinely lost the request. Verified on
-                    // the device: its own log says "unable to find token", the
-                    // stale :bbterm service survives 'am force-stop', and
-                    // force-stopping and reopening the manager app does NOT
-                    // clear it, because the Shizuku *server* is what still
-                    // holds the binder. So say the thing that actually works
-                    // instead of a remedy we have seen fail.
+                    // The Shizuku *server* still holds a binder for a dead
+                    // :bbterm, and neither force-stop nor restarting the manager
+                    // clears it. The message below is what actually works.
                     Log.w("BBterm", "no binder after " + MAX_RETRIES
                             + " attempts; the Shizuku server is holding a"
                             + " binder for a dead service.");
@@ -454,6 +411,12 @@ public class Shell {
     }
 
     public boolean isReady() { return svc != null; }
+
+    public int uid() { return 2000; }
+
+    public String describe() {
+        return "uid 2000 shell via Shizuku/ByteZuku";
+    }
 
     private static final class Res {
         String out;
@@ -511,11 +474,10 @@ public class Shell {
                         ? res.out : res.err;
                 UI.post(new Runnable() {
                     public void run() {
-                        // transact() returning false means the service process
-                        // does not know this message code at all, i.e. it is an
-                        // older build still running in the :bbterm process.
-                        // The app cannot kill it -- that process is uid 2000 and
-                        // owned by the manager, not by us -- so say what to do.
+                        // A false transact() means the service does not know
+                        // this message code at all - an older build still in the
+                        // :bbterm process, which we cannot kill (uid 2000, owned
+                        // by the manager).
                         if (res.err != null && res.err.contains("transact rejected")) {
                             Log.w("BBterm", "service rejected code " + code
                                     + " - stale :bbterm process");
@@ -564,13 +526,10 @@ public class Shell {
     }
 
     /**
-     * Push a file to the shell and return the byte count, or an error string.
-     *
      * Used by pkg, which needs its generated script on the device as a real
-     * file so it can be started in the background. It cannot be pasted inline
-     * because this busybox's ash writes here-documents to a temp file under
-     * /data/local, which uid 2000 cannot write to - so a here-doc based
-     * install would fail for a reason that has nothing to do with installing.
+     * file to start it in the background: ash (toybox or the sh that ships on
+     * the device) writes here-documents
+     * to a temp file under /data/local, which uid 2000 cannot write to.
      */
     public String uploadTo(java.io.File f, String remote) {
         try {
@@ -581,17 +540,14 @@ public class Shell {
     }
 
     /**
-     * Run a command with a file on its stdin.
-     *
-     * Needed because pm cannot read an apk off /storage/emulated/0 - the sdcard
+     * Needed because pm cannot read an apk off /storage/emulated/0: the sdcard
      * is FUSE and the package manager streams the file through a pipe, which
-     * fails there. 'pm install -S <bytes> -' is the way through, and that
-     * requires the bytes to actually arrive on stdin.
+     * fails there. 'pm install -S <bytes> -' works, and needs the bytes on
+     * stdin.
      *
-     * The file is uploaded first as its own transaction, then the command runs
-     * with 'cat <staged> |' in front of it. Doing it that way rather than
-     * holding the stream open across the transact avoids a binder call that
-     * blocks for the whole upload, and if the upload fails nothing is run.
+     * The file is uploaded as its own transaction first, then the command runs
+     * with 'cat <staged> |' in front of it: holding the stream open across the
+     * transact would block a binder call for the whole upload.
      */
     public void execFromStream(final java.io.File f, String script) throws Exception {
         final int id = seq.incrementAndGet();
@@ -653,19 +609,14 @@ public class Shell {
                 in.close();
             }
             if (!b.transact(ShellService.MSG_UPLOAD, d, r, 0)) {
-                // transact() returns false only when the callee does not know
-                // the code, which means the bound :bbterm predates the upload
-                // message. Saying "rejected" on its own sent me looking in the
-                // wrong place entirely.
+                // false only when the callee does not know the code - the bound
+                // :bbterm predates the upload message.
                 throw new IllegalStateException(
                         "the running shell service is an older build and does"
                         + " not support uploads. " + STALE_MSG);
             }
             r.readException();
-            // replyOne writes out, err, code - in that order. Reading one
-            // string and calling it the error made every successful upload
-            // look like a failure, and the "error" it printed was just the
-            // byte count. Then readLong() on an int field for good measure.
+            // replyOne writes out, err, code in that order
             String out = r.readString();
             String err = r.readString();
             int code = r.readInt();
@@ -688,10 +639,7 @@ public class Shell {
         }
     }
 
-    /**
-     * Ask the service which build it is. A null reply means it does not know
-     * the message at all, i.e. it is an older process.
-     */
+    /** a null reply means the service does not know the message at all */
     public void pingBuild(Raw r) { runAsync(ShellService.MSG_PING, "", r); }
 
     /** what to tell the user when the bound service is not the one we shipped */

@@ -1,30 +1,16 @@
 package com.BB465_stuff.Terminal;
 
-/**
- * Decides when typed PowerShell input is a complete statement.
- *
- * This lives on its own, with no Android imports, for two reasons. It is pure
- * string logic and deserves to be testable off-device - the terminal class
- * cannot even be loaded without a real framework, because its static Handler
- * field blows up on the stub. And it is fiddly enough to want its own
- * tests.
- */
+/** Pure string logic, no Android imports, so it stays unit-testable off-device. */
 public final class PsInput {
 
     /**
-     * Is this PowerShell input a complete statement yet?
+     * Walks the text tracking quote state, here-strings and bracket depth, then
+     * refuses to call it complete if the last real character means "more
+     * follows" - a trailing pipe, comma, backtick or operator.
      *
-     * Walks the text once, tracking quote state, here-strings and bracket
-     * depth, then refuses to call it complete if the last real character is an
-     * operator that means "more follows" - a trailing pipe, a comma, a
-     * backtick, or an arithmetic or comparison operator.
-     *
-     * Deliberately a heuristic. Getting it wrong in the cautious direction
-     * just means the prompt shows '>>' and waits for another line, which the
-     * user can always finish. Getting it wrong the other way sends a fragment
-     * to PowerShell and gets a ParserError, which is exactly what this exists
-     * to prevent: a block opener sent on its own used to come back as "n="
-     * followed by "Unexpected token '}'".
+     * A heuristic, and biased towards false: wrongly waiting just shows '>>',
+     * which the user can finish. Wrongly proceeding sends a fragment to
+     * PowerShell and gets a ParserError.
      */
     public static boolean complete(String text) {
         if (text == null) return true;
@@ -32,10 +18,8 @@ public final class PsInput {
         char inQuote = 0;                 // 0, '\'' or '"'
         String here = null;               // "'@" or "\"@" while inside one
         boolean escaped = false;
-        // the last character that actually counted, ignoring whitespace and
-        // ignoring anything after a '#'. Needed because a comment can hide the
-        // real end of the line: 'Get-ChildItem | # now filter' still wants a
-        // continuation, and looking at the final 'r' of "filter" would not say so.
+        // last character that counted, ignoring whitespace and comments: a
+        // comment can hide the real end, as in 'Get-ChildItem | # now filter'
         char lastSignificant = 0;
 
         for (int i = 0; i < text.length(); i++) {
@@ -66,10 +50,8 @@ public final class PsInput {
             }
 
             if (c == '#') {
-                // In PowerShell '#' starts a comment anywhere outside a string,
-                // not just at the start of a line. Getting this wrong hides
-                // what came before it, so 'Get-ChildItem | # now filter' would
-                // look complete when the pipe is still waiting for input.
+                // '#' comments out the rest of the line anywhere outside a
+                // string, not just at the start of a line
                 int nl = text.indexOf('\n', i);
                 if (nl < 0) break;         // rest is a comment, done
                 i = nl;
@@ -80,8 +62,8 @@ public final class PsInput {
             if (c == '"')  { inQuote = '"';  continue; }
             if (c == '@' && i + 1 < text.length()
                     && (text.charAt(i + 1) == '\'' || text.charAt(i + 1) == '"')) {
-                // @' or @" opens a here-string, but only when it is the last
-                // thing on its line, otherwise it is a splat like $env:PATH
+                // @' or @" is a here-string only when last on its line,
+                // otherwise it is a splat like $env:PATH
                 int nl = text.indexOf('\n', i);
                 String tail = (nl < 0) ? text.substring(i + 2)
                                        : text.substring(i + 2, nl).trim();

@@ -4,32 +4,19 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * apkinstall: install an APK from the terminal, with the flags you already
- * know from 'adb install'.
+ * apkinstall: install an APK from the terminal, with the flags you know from
+ * 'adb install'. Two reasons this is not just a shell out to 'pm install':
  *
- * Why this is not just a shell out to 'pm install':
+ *  1. pm cannot read an apk off /storage/emulated/0 - the sdcard is a FUSE mount
+ *     and the package manager streams the file through a pipe, which fails in
+ *     IPackageManagerImpl.onTransact. Those are piped in with
+ *     'pm install -S <bytes> -'; files already on /data/local/tmp are passed as
+ *     a plain path, which is cheaper.
+ *  2. pm install neither expands '~' nor searches PATH, so a bare name is
+ *     resolved here: absolute, the session's own directory, or Download.
  *
- *  1. pm CANNOT read an apk off /storage/emulated/0. The sdcard is a FUSE
- *     mount and the package manager streams the file through a pipe, which
- *     fails there with a transaction error from onTransact. Verified on the
- *     device:
- *       pm install -r -g /data/local/tmp/selftest.apk   -> Success
- *       pm install -r -g /storage/emulated/0/Download/... -> fails in
- *           PackageManagerService$IPackageManagerImpl.onTransact
- *     So anything on the sdcard has to be piped in with 'pm install -S <bytes>
- *     -', reading stdin from the file. /data/local/tmp files are passed as a
- *     plain path, which is the cheaper route when the file is already there.
- *
- *  2. pm install does not expand '~' or search PATH, so 'apkinstall foo.apk'
- *     has to resolve the name itself: absolute, relative to the session's
- *     directory, or under the user's Download folder where a browser puts it.
- *
- * Runs as uid 2000 through the shell transport, which is the same identity
- * 'adb install' uses. No root is involved and none is implied: if you ever
- * install something that needs more, the command will say so rather than
- * pretend.
- *
- * Nothing is hardcoded to this headset beyond the usual Download location.
+ * Runs as uid 2000 through the shell transport, the same identity 'adb install'
+ * uses. Nothing is hardcoded to this headset beyond the Download location.
  */
 public final class Apk {
 

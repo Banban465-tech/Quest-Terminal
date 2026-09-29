@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="res/terminal.png" width="110" alt="Quest Terminal">
+  <img src="terminal.png" width="110" alt="Quest Terminal">
 </p>
 
 <h1 align="center">Quest Terminal</h1>

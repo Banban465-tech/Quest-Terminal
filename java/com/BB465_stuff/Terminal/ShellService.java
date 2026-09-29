@@ -16,33 +16,19 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Shell service for the terminal.
+ * Shizuku starts this in its own process as uid 2000 (shell), which is what
+ * gives a real command environment with no root: logcat, dumpsys, pm, am,
+ * settings. It cannot ptrace/inject (EPERM
+ * under SELinux Enforcing), run su, or pair adb (ro.adb.secure=1).
  *
- * Shizuku starts this in its own process running as uid 2000 (shell), which is
- * what gives a real command environment with no root: logcat, dumpsys, pm, am,
- * settings, and the busybox already sitting in /data/local/tmp.
+ * Extends Binder, not Service: ByteZuku's starter calls Class.newInstance() and
+ * casts the instance itself to IBinder, so a Service subclass dies on
+ * ClassCastException and a missing zero-arg ctor dies on InstantiationException.
+ * Binder satisfies both and asBinder() returns this.
  *
- * What uid 2000 can NOT do, and this does not pretend otherwise:
- *  - ptrace / inject        EPERM under SELinux Enforcing, so no frida, no mic
- *  - su                     needs real root
- *  - adb pair / wireless    ro.adb.secure=1, needs an RSA key we do not hold
- *
- * Why this extends Binder rather than Service. Stock Shizuku instantiates a
- * Service subclass and calls onBind(null). ByteZuku (com.byteus.bytezuku) does
- * not: its starter is moe.shizuku.starter.ServiceStarter ->
- * rikka.shizuku.N10.a, which calls Class.newInstance() and then casts the
- * *instance itself* to IBinder:
- *
- *   InstantiationException: ... has no zero argument constructor   (needs ctor)
- *   ClassCastException: ShellService cannot be cast to IBinder      (needs Binder)
- *
- * Extending Binder satisfies the cast for free and asBinder() still returns
- * this, so the fork can hand it straight back to its server.
- *
- * Why raw Parcel instead of Messenger. Messenger.writeToParcel only carries
- * what/arg1/arg2/replyTo -- it silently drops Message.obj, so the command
- * string never arrived. We own both ends, so the wire format is a plain
- * synchronous transact: write token, id, command; read back out, err, code.
+ * Raw Parcel, not Messenger: Messenger.writeToParcel drops Message.obj, so the
+ * command string never arrived. We own both ends, so the wire is a plain
+ * synchronous transact - token, id, command; read back out, err, code.
  */
 public class ShellService extends Binder {
 
@@ -52,11 +38,10 @@ public class ShellService extends Binder {
     public static final int MSG_DESCRIBE = 2;
 
     /**
-     * PowerShell session control. The session is a real long-lived pwsh process
-     * on the far side, so $variables, imported modules and the working
-     * directory all survive from one line to the next. Lines are delimited by
-     * writing a sentinel line after each command and reading stdout until it
-     * comes back, which is how a REPL can be driven over a one-shot RPC.
+     * PowerShell session control. A real long-lived pwsh process, so variables,
+     * modules and the working directory survive between lines. Each command is
+     * followed by a sentinel line and the reader collects stdout until it comes
+     * back, which is how a REPL is driven over a one-shot RPC.
      */
     public static final int MSG_PS_START = 3;
     public static final int MSG_PS_LINE  = 4;
@@ -64,18 +49,14 @@ public class ShellService extends Binder {
     /** the app pushing a file to the shell, used by apkinstall */
     public static final int MSG_UPLOAD   = 6;
     /**
-     * Handshake: the app asks which build the service is.
-     *
-     * A :bbterm process from an older install can outlive the app, because
-     * 'am force-stop' does not kill it and the Shizuku server keeps its binder.
-     * The app then talks to a service that has never heard of the newer
-     * message codes, and the only symptom is a confusing mid-command failure
-     * like "service rejected the upload" with no hint why. Asking on connect
-     * turns that into one clear line at startup, while it is still cheap.
+     * Handshake. A :bbterm from an older install can outlive the app -
+     * force-stop does not kill it and the Shizuku server keeps its binder - and
+     * the only symptom is a confusing mid-command failure. Asking on connect
+     * turns that into one clear line at startup.
      */
     public static final int MSG_PING     = 7;
     /** bump whenever the message codes or their payloads change */
-    public static final String BUILD = "2026-09-27.7";
+    public static final String BUILD = "2026-09-29.1";
 
     /** wrapper that puts the glibc loader in front of the real pwsh binary */
     public static final String PWSH = "/data/local/tmp/pwsh/pwsh.sh";
@@ -86,6 +67,16 @@ public class ShellService extends Binder {
     private static final int PS_TIMEOUT_MS = 25000;
     /** bumped per call so a stale sentinel can never end the wrong reply */
     private static int psSeq = 0;
+
+    /**
+     * One probe at startup so the UI can name the build it actually got. The
+     * leading BB tag is the point: an echoed prompt or a stray line cannot pass
+     * off as a version, so the UI only renders a banner it can parse.
+     */
+    private static final String PS_VERSION_CMD =
+            "'BB|' + $PSVersionTable.PSVersion + '|' + $PSVersionTable.PSEdition"
+          + " + '|' + $PSVersionTable.OS + '|' + $PSVersionTable.Platform";
+
 
     private Process psProc;
     private PrintWriter psIn;
@@ -100,38 +91,25 @@ public class ShellService extends Binder {
     public static final String KEY_CODE = "code";
     public static final String KEY_ID   = "id";
 
-    /** already on the device, and a decade newer than anything we would ship */
-    public static final String BUSYBOX = "/data/local/tmp/busybox";
+    /*
+     * No bundled busybox, and none needed: Meta Quest ships toybox in
+     * /system/bin, which answers every applet the generated scripts and the
+     * environment used to reach through $BB.
+     */
 
     /**
-     * Where 'pkg install' puts packages.
-     *
-     * Deliberately NOT PREFIX. PREFIX is on /storage/emulated/0, which is a
-     * FUSE mount that refuses both symlink() and link() with EACCES - checked
-     * on the device:
-     *
-     *   ln -s somefile <PREFIX>/linktest   -> Permission denied
-     *   ln         <PREFIX>/somefile ...  -> Permission denied
-     *   ln -s somefile /data/local/tmp/... -> ok
-     *
-     * Nearly every Termux package ships symlinks (bin/python is a link to
-     * bin/python3.14), so untarring into PREFIX fails outright:
-     *   tar: can't create symlink './data/.../share/doc/hello/copyright'
-     * and the install dies partway through. /data/local/tmp is ext4, uid 2000
-     * owned and survives a reboot.
-     *
-     * The trade-offs, stated rather than glossed: /data/local/tmp is outside
-     * the app so the packages outlive an uninstall, it is wiped by a factory
-     * reset, and it is not private to this app. It is not on the sdcard, so
-     * it will not appear in a file manager.
+     * Where 'pkg install' puts packages. Deliberately NOT PREFIX: /storage is a
+     * FUSE mount that refuses symlink() and link() with EACCES, and nearly
+     * every Termux package ships symlinks (bin/python -> bin/python3.14), so
+     * untarring there dies partway through. /data/local/tmp is ext4, uid 2000
+     * owned, and survives a reboot - but it is outside the app, so packages
+     * outlive an uninstall, a factory reset wipes it, and it is not private.
      */
     public static final String PKGROOT = "/data/local/tmp/bbpkg";
 
     /**
-     * Package prefix. Lives in the app's own external files dir rather than
-     * /data/local/tmp so an uninstall cleans it up and a stray install cannot
-     * scribble somewhere shared. uid 2000 can read it once the app has chmod'd
-     * it, which was verified on device.
+     * In the app's own external files dir rather than /data/local/tmp, so an
+     * uninstall cleans it up. uid 2000 can read it once chmod'd.
      */
     public static final String PREFIX =
             "/storage/emulated/0/Android/data/com.BB465_stuff.Terminal/files/bbterm";
@@ -225,13 +203,10 @@ public class ShellService extends Binder {
     }
 
     /**
-     * Write a file the app sent over to somewhere the shell can read.
-     *
-     * Only used by apkinstall. pm cannot read an apk straight off the sdcard
-     * because the package manager streams it through a pipe and /storage is a
-     * FUSE mount, so the bytes are staged on a real filesystem first.
-     * Returns the byte count so the caller can pass a truthful -S to pm;
-     * a short write is an error rather than a silently truncated install.
+     * Used by apkinstall: pm streams an apk through a pipe and /storage is a
+     * FUSE mount, so the bytes are staged on a real filesystem first. Returns
+     * the byte count so the caller can pass a truthful -S to pm; a short write
+     * is an error rather than a silently truncated install.
      */
     private Result upload(Parcel data) {
         Result r = new Result();
@@ -273,11 +248,9 @@ public class ShellService extends Binder {
     }
 
     /**
-     * The client writes [interfaceToken][int id][string payload] for every
-     * code. A Parcel is a sequential cursor, so a handler that skips the int
-     * lands its readString() on the int and the command arrives as "0" -
-     * PowerShell then prints nothing and every reply comes back empty.
-     * Always drain all three fields.
+     * Every client call starts [interfaceToken][int id][string payload]. A
+     * Parcel is a sequential cursor, so skipping the int lands readString() on
+     * the int and the command arrives as "0". Drain all three fields.
      */
     private static String readPayload(Parcel data) {
         try {
@@ -307,18 +280,46 @@ public class ShellService extends Binder {
     }
 
     /**
-     * Point TLS clients at the CA bundle the ca-certificates package installed.
-     *
-     * Without this, python reports
-     *   CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate
-     * for every https request, which reads like "the headset has no internet"
-     * when in fact the network is fine and python is simply looking in the
-     * wrong place. The bundle lands at PKGROOT/etc/tls/cert.pem, which no
-     * default search path covers, so it has to be named explicitly.
-     *
-     * Set only when the file is actually there. Pointing a client at a missing
-     * file would turn a working default into a failure, which is worse than
-     * leaving it alone.
+     * The one environment every command gets, whether it runs through the
+     * Shizuku service or the local su path, so both behave the same. The
+     * exports are also repeated inside the command string for the PowerShell
+     * session, because su sanitises parts of the environment on some managers.
+     */
+    public static void applyEnv(java.util.Map<String, String> env) {
+        env.put("PATH", PKGROOT + "/bin:" + PREFIX + "/bin:"
+                + "/system/bin:/system/xbin:/vendor/bin:/debug_ramdisk");
+        env.put("HOME", PREFIX);
+        // Termux binaries carry an absolute RPATH into Termux's own lib dir, so
+        // they only load here because LD_LIBRARY_PATH names ours first.
+        env.put("LD_LIBRARY_PATH",
+                PKGROOT + "/lib:" + PREFIX + "/lib:/system/lib64:/system/lib");
+        env.put("TMPDIR", PKGROOT + "/tmp");
+        exportCaPaths(env);
+    }
+
+    /** the same environment as sh statements, for command strings that must
+     *  survive a su which rewrites the environment */
+    public static String envExports() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("export PATH=").append(shq(PKGROOT + "/bin:" + PREFIX + "/bin:"
+                + "/system/bin:/system/xbin:/vendor/bin:/debug_ramdisk"));
+        sb.append("; export HOME=").append(shq(PREFIX));
+        sb.append("; export LD_LIBRARY_PATH=")
+          .append(shq(PKGROOT + "/lib:" + PREFIX + "/lib:/system/lib64:/system/lib"));
+        sb.append("; export TMPDIR=").append(shq(PKGROOT + "/tmp"));
+        return sb.toString();
+    }
+
+    /** single-quote a string for /system/bin/sh */
+    public static String shq(String s) {
+        return "'" + s.replace("'", "'\\''") + "'";
+    }
+
+    /**
+     * Without this python reports CERTIFICATE_VERIFY_FAILED for every https
+     * request, which reads like "no internet" when the network is fine. Only
+     * set when the bundle exists: pointing a client at a missing file turns a
+     * working default into a failure.
      */
     private static void exportCaPaths(java.util.Map<String, String> env) {
         String pem = PKGROOT + "/etc/tls/cert.pem";
@@ -335,9 +336,9 @@ public class ShellService extends Binder {
     // ------------------------------------------------------------ powershell
 
     /**
-     * Start the persistent pwsh. -Command - makes it read statements from
-     * stdin, which is what lets one process serve a whole session. No TTY means
-     * no prompt of its own, so the app draws the PS C:\...> line itself.
+     * -Command - makes pwsh read statements from stdin, so one process serves
+     * the whole session. No TTY means no prompt of its own, so the app draws the
+     * PS C:\...> line itself.
      */
     private synchronized Result psStart() {
         Result r = new Result();
@@ -352,17 +353,7 @@ public class ShellService extends Binder {
                     "sh", PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-");
             pb.directory(cwd);
             pb.redirectErrorStream(true);
-            pb.environment().put("PATH", PKGROOT + "/bin:" + PREFIX + "/bin:"
-                    + "/system/bin:/system/xbin:/vendor/bin");
-            pb.environment().put("HOME", PREFIX);
-            // Termux binaries are linked against /data/data/com.termux/files/usr/lib,
-            // which cannot exist on a device without Termux installed, and their
-            // RPATH is absolute so it cannot be patched. This is the only way they
-            // find their shared libraries. See Pkg for the details.
-            pb.environment().put("LD_LIBRARY_PATH",
-                    PKGROOT + "/lib:" + PREFIX + "/lib:/system/lib64:/system/lib");
-            pb.environment().put("TMPDIR", PKGROOT + "/tmp");
-        exportCaPaths(pb.environment());
+            applyEnv(pb.environment());
             psProc = pb.start();
             psIn = new PrintWriter(psProc.getOutputStream(), true);
             psOutReader = new BufferedReader(
@@ -377,9 +368,8 @@ public class ShellService extends Binder {
                             psQ.offer(l);
                             if (psQ.size() > 2000) psQ.poll();
                         }
-                        // EOF: pwsh quit on its own. Say why, it is otherwise
-                        // invisible and just looks like every reply came back
-                        // empty.
+                        // EOF: pwsh quit on its own, which otherwise just looks
+                        // like every reply came back empty
                         android.util.Log.i("BBterm", "pwsh stdout closed, exit="
                                 + proc.exitValue());
                     } catch (Throwable t) {
@@ -389,11 +379,10 @@ public class ShellService extends Binder {
             };
             psReader.setDaemon(true);
             psReader.start();
-            // Process.pid() is not in Android's boot classpath, it throws
-            // NoSuchMethodError at runtime. We only wanted a breadcrumb.
+            // Process.pid() is not in Android's boot classpath (NoSuchMethodError)
             android.util.Log.i("BBterm", "pwsh started, service pid="
                     + android.os.Process.myPid());
-            r.out = "ok";
+            r.out = psVersion();
         } catch (Throwable t) {
             r.err = "pwsh start failed: " + t
                     + "\nis " + PWSH + " still installed?";
@@ -405,11 +394,34 @@ public class ShellService extends Binder {
     private BufferedReader psOutReader;
 
     /**
-     * Send one line to the live session and collect everything it printed up to
-     * the sentinel. Bounded by PS_TIMEOUT_MS so a command that never returns
-     * (Read-Host, an interactive prompt) cannot wedge the service forever; the
-     * session is killed and reported dead so the next pwshstart is clean.
+     * Collects everything the command printed up to the sentinel. Bounded by
+     * PS_TIMEOUT_MS so a command that never returns (Read-Host, an interactive
+     * prompt) cannot wedge the service; the session is killed so the next
+     * pwshstart is clean.
      */
+    /**
+     * Version/edition/os/platform for the banner, always in the BB|... form so
+     * the UI can tell a live session from a dead one by shape alone. A probe
+     * that times out takes the session with it (psLine kills it), and that must
+     * not be reported as a successful start, so the error is passed through.
+     */
+    private String psVersion() {
+        try {
+            Result v = psLine(PS_VERSION_CMD);
+            if (v.code == 0) {
+                String s = v.out == null ? "" : v.out.trim();
+                if (s.startsWith("BB|")) return s;
+            }
+            if (psProc == null || !psProc.isAlive()) {
+                return (v.err != null && v.err.length() > 0) ? v.err
+                        : "pwsh start failed: the version probe took the session down";
+            }
+        } catch (Throwable t) {
+            android.util.Log.w("BBterm", "pwsh version probe failed", t);
+        }
+        return "BB|unknown|Unknown||";
+    }
+
     private synchronized Result psLine(String cmd) {
         Result r = new Result();
         if (psProc == null || !psProc.isAlive() || psIn == null) {
@@ -417,15 +429,12 @@ public class ShellService extends Binder {
             r.code = -1;
             return r;
         }
-        // A unique sentinel per call. With one shared sentinel, a line left in
-        // the queue by an earlier call (or by a reader thread that outlived its
-        // process) would terminate this call instantly and report no output,
-        // which is exactly the empty reply this used to give.
+        // Unique per call: a shared sentinel could be terminated by a line left
+        // in the queue by an earlier call, reporting no output.
         final String sentinel = PS_SENTINEL + (++psSeq);
         StringBuilder o = new StringBuilder();
         try {
-            // drop anything stale before we send, so this call only ever sees
-            // output that its own command produced
+            // drop anything stale, so this call only sees its own output
             psQ.clear();
             psIn.println(cmd);
             psIn.println("[Console]::Out.WriteLine('" + sentinel + "')");
@@ -497,18 +506,7 @@ public class ShellService extends Binder {
         ProcessBuilder pb = new ProcessBuilder("sh", "-c", cmdline);
         pb.directory(cwd);
         pb.redirectErrorStream(false);
-        pb.environment().put("PATH", PKGROOT + "/bin:PREFIX/bin:"
-                + "/system/bin:/system/xbin:/vendor/bin");
-        pb.environment().put("BB", BUSYBOX);
-        pb.environment().put("HOME", PREFIX);
-        // Termux binaries are linked against /data/data/com.termux/files/usr/lib,
-        // which cannot exist on a device without Termux installed, and their
-        // RPATH is absolute so it cannot be patched. This is the only way they
-        // find their shared libraries. See Pkg for the details.
-        pb.environment().put("LD_LIBRARY_PATH",
-                PKGROOT + "/lib:" + PREFIX + "/lib:/system/lib64:/system/lib");
-        pb.environment().put("TMPDIR", PKGROOT + "/tmp");
-        exportCaPaths(pb.environment());
+        applyEnv(pb.environment());
         Process p = pb.start();
 
         // both pipes must be drained at once or a chatty command deadlocks

@@ -22,14 +22,13 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Tabbed terminal.
- *
- * Each tab is an independent session with its own scrollback, cwd and history.
- * Commands go over a Messenger to ShellService, which Shizuku runs as uid 2000.
+ * Tabbed terminal. Each tab is an independent session with its own scrollback,
+ * cwd and history. Commands go over a Parcel transact to ShellService, which
+ * Shizuku runs as uid 2000.
  *
  * The builtins live here rather than in the service because they are UI-level
- * conveniences (tab state, local history) except for pkg/su/info which are
- * handed to the shell.
+ * conveniences (tab state, local history), except pkg/su/info which are handed
+ * to the shell.
  */
 public class TerminalActivity extends Activity {
 
@@ -64,23 +63,21 @@ public class TerminalActivity extends Activity {
         volatile int uid = 2000;
         /**
          * PowerShell input typed but not yet sent, because it is mid-block.
-         * Each line used to be executed the moment it arrived, so a block
-         * opener was a broken fragment:
-         *   foreach ($i in 1..3) {   ->  "n="   then a ParserError on the '}'
-         * and the sentinel got absorbed into the loop body. Holding the text
-         * until it is a complete statement is what makes a loop, a function
-         * or a here-string work at all.
+         * Executing each line as it arrived turned a block opener into a
+         * broken fragment: "foreach ($i in 1..3) {" came back as "n=" and
+         * then a ParserError on the '}'. Holding the text until it is a
+         * complete statement is what makes loops, functions and here-strings
+         * work at all.
          */
         final StringBuilder psPending = new StringBuilder();
         /** where we were before the last cd, for 'cd -' */
         String prevCwd = "";
     }
 
-    private Shell sh;
-    // in-process adb transport, used when Shizuku/ByteZuku is unavailable
-    private AdbKey adbKey;
-    private String adbHost;
-    private int adbPort;
+    /** null means nothing is up, and the status line has to say why */
+    private Transport sh;
+    private SuShell suT;
+    private AdbShell adbT;
     private static final android.os.Handler UI =
             new android.os.Handler(android.os.Looper.getMainLooper());
 
@@ -120,20 +117,14 @@ public class TerminalActivity extends Activity {
     protected void onResume() {
         super.onResume();
         tick.postDelayed(poller, 300);
-        // No automatic adb arming any more. It was a guess that cost 15s of
-        // socket timeouts on every launch and could never succeed: the PC's
-        // key is paired over the WIFI TLS transport, adbd tracks authorisation
-        // per transport, and a plain TCP 5555 connection from inside the app
-        // gets a confirmation prompt a headset cannot answer. adb_keys is
-        // root-only and TLS/SPAKE2 pairing is not reimplemented here, so the
-        // shell comes from Shizuku instead. The ADB dialog is still there as
-        // a manual escape hatch if that ever changes.
+        // No automatic adb arming: the PC's key is paired over the WIFI TLS
+        // transport, adbd tracks authorisation per transport, and a plain TCP
+        // 5555 connection from inside the app gets a confirmation prompt a
+        // headset cannot answer. 'adbsetup' is the deliberate route.
     }
 
-    // ------------------------------------------------------------ adb endpoint
     // adbd keeps a fixed tcp port in persist.adb.tcp.port, so the app can find
-    // its own device over loopback and re-arm the transport with no UI at all.
-
+    // its own device over loopback and re-arm the transport with no UI.
     private android.content.SharedPreferences adbPrefs() {
         return getSharedPreferences("adbcfg", android.content.Context.MODE_PRIVATE);
     }
@@ -154,120 +145,11 @@ public class TerminalActivity extends Activity {
         return 5555;
     }
 
-    /** This device's own non-loopback IPv4 address, so the app looks like a LAN host. */
-    private String adbLanIp() {
-        try {
-            java.util.Enumeration<java.net.NetworkInterface> nis =
-                java.net.NetworkInterface.getNetworkInterfaces();
-            while (nis != null && nis.hasMoreElements()) {
-                java.net.NetworkInterface ni = nis.nextElement();
-                java.util.Enumeration<java.net.InetAddress> as = ni.getInetAddresses();
-                while (as.hasMoreElements()) {
-                    java.net.InetAddress ia = as.nextElement();
-                    if (!ia.isLoopbackAddress() && ia.getAddress().length == 4) {
-                        return ia.getHostAddress();
-                    }
-                }
-            }
-        } catch (Throwable t) {
-            android.util.Log.i("BBterm", "adbLanIp failed: " + t);
-        }
-        return null;
-    }
-
     private static String readAll(java.io.BufferedReader r) throws java.io.IOException {
         StringBuilder b = new StringBuilder();
         String line;
         while ((line = r.readLine()) != null) b.append(line).append('\n');
         return b.toString();
-    }
-
-    private AdbKey loadAdbKey() {
-        // An app cannot add its own key to adb_keys: modern adbd only accepts
-        // new keys over the TLS/SPAKE2 wireless pairing transport, and
-        // /data/misc/adb is unreadable even to shell. So prefer a key the
-        // developer has already authorised on the PC, which needs no pairing.
-        try {
-            java.io.File pub = new java.io.File("/data/local/tmp/pc_adbkey");
-            if (pub.isFile() && pub.canRead()) {
-                AdbKey k = AdbKey.fromPem(pub);
-                try {
-                    java.security.MessageDigest md =
-                        java.security.MessageDigest.getInstance("SHA-256");
-                    byte[] h = md.digest(k.encodeBase64().getBytes("UTF-8"));
-                    StringBuilder sb = new StringBuilder();
-                    for (int i = 0; i < 16; i++) {
-                        sb.append(String.format("%02x", h[i]));
-                    }
-                    android.util.Log.i("BBterm", "keyhash=" + sb);
-                } catch (Throwable t2) { }
-                return k;
-            }
-        } catch (Throwable t) { /* fall through to our own key */ }
-        try {
-            java.io.File f = new java.io.File(getFilesDir(), "adbkey");
-            return f.isFile() ? AdbKey.fromPem(f) : null;
-        } catch (Throwable t) { return null; }
-    }
-
-    /**
-     * Bring the adb transport up on its own. Tries the remembered endpoint
-     * first, then loopback on the device's persisted adbd port. Runs off the UI
-     * thread and reports the outcome to logcat under the BBterm tag.
-     */
-    private void autoArmAdb() {
-        if (sh != null) return;
-        final String host = adbPrefs().getString("host", null);
-        final int port = adbPrefs().getInt("port", 0);
-        new Thread(new Runnable() {
-            public void run() {
-                final AdbKey k = loadAdbKey();
-                if (k == null) {
-                    android.util.Log.i("BBterm", "autoArm: no adb key yet");
-                    return;
-                }
-                int devPort = port > 0 ? port : adbDevicePort();
-                String lan = adbLanIp();
-
-                // Prefer a LAN address: a loopback connection comes from an app
-                // on the device itself, and adbd demands an interactive
-                // confirmation for those, which a headset cannot satisfy.
-                java.util.LinkedHashMap<String, Integer> cand =
-                    new java.util.LinkedHashMap<String, Integer>();
-                if (host != null && host.indexOf("127.0.0.1") < 0) cand.put(host, devPort);
-                if (lan != null && !lan.equals("127.0.0.1")) cand.put(lan, devPort);
-                cand.put("127.0.0.1", devPort);
-                android.util.Log.i("BBterm", "autoArm: lan=" + lan
-                    + " port=" + devPort + " saved=" + host);
-
-                for (java.util.Map.Entry<String, Integer> e : cand.entrySet()) {
-                    AdbLink link = new AdbLink(k);
-                    try {
-                        if (link.connect(e.getKey(), e.getValue())) {
-                            final String hh = e.getKey();
-                            final int pp = e.getValue();
-                            post(new Runnable() {
-                                public void run() {
-                                    adbKey = k; adbHost = hh; adbPort = pp;
-                                    if (sh == null && status != null) {
-                                        status.setText("shizuku: down | adb " + hh + ":" + pp);
-                                    }
-                                }
-                            });
-                            android.util.Log.i("BBterm", "autoArm: connected " + hh + ":" + pp);
-                            return;
-                        }
-                        android.util.Log.i("BBterm", "autoArm: no " + e.getKey()
-                            + " -> " + link.lastLog());
-                    } catch (Throwable t) {
-                        android.util.Log.i("BBterm", "autoArm: " + e.getKey() + " error " + t);
-                    } finally {
-                        link.close();
-                    }
-                }
-                android.util.Log.i("BBterm", "autoArm: no endpoint worked");
-            }
-        }).start();
     }
 
     @Override
@@ -299,12 +181,186 @@ public class TerminalActivity extends Activity {
 
     private Shell.Callback shCb;
 
+    // ---------------------------------------------------------------- transports
+
+    /** one line naming what is actually running commands, for status and help */
+    private String transportLine() {
+        if (sh == null) return "no transport";
+        return sh.describe();
+    }
+
+    private void setTransport(Transport t, String note) {
+        Transport old = sh;
+        sh = t;
+        if (old != null && old != t && old instanceof SuShell) ((SuShell) old).shutdown();
+        if (old != null && old != t && old instanceof AdbShell) ((AdbShell) old).shutdown();
+        for (Session s : sessions) {
+            if (t != null) s.uid = t.uid();
+            if (s.ps && t != null && old != t) {
+                // a live pwsh pipe belongs to the transport that started it
+                s.ps = false;
+            }
+        }
+        if (status != null) status.setText(note);
+    }
+
+    /**
+     * Root won, so every later command goes through su instead of whatever was
+     * running before. uid 0 is a superset of uid 2000, so there is nothing to
+     * give up by switching.
+     */
+    private void adoptRoot(String suPath) {
+        if (shCb == null) shCb = makeCallback();
+        suT = new SuShell(suPath, shCb);
+        setTransport(suT, "root: uid 0 via su " + suPath);
+        pput("suPath", suPath);
+        pput("suGranted", "1");
+        loadFacts();
+        render();
+    }
+
+    /** the adb client is now talking to this device; use it for commands */
+    private void adoptAdb(String device) {
+        if (shCb == null) shCb = makeCallback();
+        adbT = new AdbShell(this, device, shCb);
+        adbT.refreshUid();
+        setTransport(adbT, "adb: " + device);
+        pput("adbDev", device);
+        loadFacts();
+        render();
+    }
+
+    private void adoptShizuku() {
+        if (shCb == null) shCb = makeCallback();
+        setTransport(shCbReady, "shizuku: connected (uid 2000 shell)");
+    }
+
+    /** set by the Shizuku callback, so adbsetup can fall back to it */
+    private Shell shCbReady;
+
+    /**
+     * The adb banner for a screen being drawn right now. Never forks adb: the
+     * version is warmed in the background, and until it lands this says so
+     * rather than blocking the UI thread on a process spawn.
+     */
+    private String adbBanner() {
+        AdbBin.warmVersion(this);
+        String v = AdbBin.versionCached();
+        if (v == null) return "present (reading version...)";
+        if (AdbBin.firstLine(v).startsWith("absent")) return "not in this build";
+        return "present (" + AdbBin.firstLine(v) + ")";
+    }
+
+    /**
+     * Nothing is running commands: wireless adb is the default, so it is
+     * connected automatically from the saved device or the fixed port adbd
+     * keeps in persist.adb.tcp.port. Once this app has paired, adbd trusts the
+     * loopback connection and no confirmation prompt is involved.
+     */
+    private void appendNoShell() {
+        final String suSaved = pget("suPath", null);
+        final boolean suWas = pon("suGranted", false);
+        final String adbSaved = pget("adbDev", null);
+        final boolean hasBin = AdbBin.available(this);
+
+        append("\n");
+        if (hasBin) {
+            append("adb client:  " + adbBanner() + "\n");
+        } else {
+            append("adb client:  not in this build\n");
+        }
+        append("su:          " + describeSuOnDisk() + "\n");
+        append("\nnothing is running commands yet. wireless adb is the default:\n\n");
+        append("  1. wireless adb   pairs once with 'adbsetup', then this app\n");
+        append("                    connects on its own at every launch. no root,\n");
+        append("                    no Shizuku.\n");
+        append("  2. su             root via the app's own su. needs a root\n");
+        append("                    manager and one approval tap.\n");
+        append("  3. checkshizuku   Shizuku/ByteZuku, running with Terminal\n");
+        append("                    granted. uid 2000.\n");
+
+        if (suWas && suSaved != null) {
+            append("\nre-checking the su you granted before...\n");
+            new Thread(new Runnable() {
+                public void run() {
+                    Su.Probe p = Su.probe(new String[]{suSaved}, 4000, 1);
+                    post(new Runnable() {
+                        public void run() {
+                            if (p.status == Su.GRANTED) {
+                                adoptRoot(p.path);
+                                append("root is still granted. uid 0.\n");
+                            } else {
+                                append("no longer granted. run 'su' to ask again.\n");
+                                autoConnectAdb(adbSaved);
+                            }
+                        }
+                    });
+                }
+            }).start();
+        } else {
+            autoConnectAdb(adbSaved);
+        }
+    }
+
+    /**
+     * Raise the wireless adb transport with no pairing UI: connect to the
+     * saved device, else to the port in persist.adb.tcp.port, else 5555. A
+     * device that was paired before answers straight away; one that never
+     * was needs 'adbsetup' once, and the message says so.
+     */
+    private void autoConnectAdb(String savedDev) {
+        if (!AdbBin.available(this)) {
+            append("no adb client in this build, so 'adbsetup' cannot run.\n");
+            appendPrompt();
+            return;
+        }
+        final String dev = (savedDev != null && savedDev.length() > 0)
+                ? savedDev : loopback(adbDevicePort());
+        append("\nconnecting the adb client to " + dev + "...\n");
+        new Thread(new Runnable() {
+            public void run() {
+                AdbBin b = adbBin(dev);
+                b.connect(dev);
+                final boolean on = b.isOnline();
+                post(new Runnable() {
+                    public void run() {
+                        if (on) {
+                            adoptAdb(dev);
+                            append("adb transport is up.\n");
+                        } else {
+                            append("no adb transport. pair once with 'adbsetup':\n");
+                            append("  Settings > Developer > Wireless debugging >\n");
+                            append("  pair device with pairing code\n");
+                            append("after that this app connects on its own.\n");
+                        }
+                        appendPrompt();
+                    }
+                });
+            }
+        }).start();
+    }
+
+    private String describeSuOnDisk() {
+        String found = Su.find();
+        if (found == null) return "no su binary on this device";
+        String mgr = Su.managerFor(found);
+        return found + (mgr == null ? "" : " (" + mgr + ")")
+                + (pon("suGranted", false) ? ", granted" : ", not granted");
+    }
+
     private Shell.Callback makeCallback() {
         // so a stale :bbterm can report itself even if it turns up later
         Shell.watchStale(this.shCb);
         return new Shell.Callback() {
             @Override
             public void onReady(Shell s) {
+                shCbReady = s;
+                if (sh != null && sh.isReady()) {
+                    // Wireless adb won the startup race and owns the terminal;
+                    // Shizuku stays on standby for 'adbuse' / 'checkshizuku'.
+                    status.setText("shizuku: connected (standby, adb is active)");
+                    return;
+                }
                 sh = s;
                 status.setText("shizuku: connected (uid 2000 shell)");
                 // ask the headset what it is before the prompt needs to say so
@@ -328,9 +384,8 @@ public class TerminalActivity extends Activity {
                 } else if (why.startsWith("the running shell service")) {
                     append(why + "\n");
                 } else {
-                    append("cannot reach a shell: " + why + "\n\n"
-                         + "Shizuku/ByteZuku must be running and this app granted.\n"
-                         + "Open the manager, grant Terminal access, then reopen.\n");
+                    append("shizuku: " + Shell.describeState() + "\n");
+                    appendNoShell();
                 }
             }
             @Override
@@ -343,10 +398,9 @@ public class TerminalActivity extends Activity {
     // ------------------------------------------------------------------ prefs
 
     /**
-     * Every preference is stored as a string and cycles through a fixed list of
-     * words. That keeps the panel dead simple -- one row type, tap to advance --
-     * and a bad stored value can never wedge a typed getter, because anything
-     * not in the list falls back to the default.
+     * Every preference is a string cycling through a fixed list of words: one row
+     * type, tap to advance, and a bad stored value can never wedge a typed
+     * getter because anything not in the list falls back to the default.
      */
     private static final class Pref {
         final String key, label;
@@ -368,14 +422,11 @@ public class TerminalActivity extends Activity {
                 "opensans", "serif-mono", "casual"),
         new Pref("scrollback",     "scrollback",   "20k", "100k", "400k"),
         new Pref("startDir",       "start folder", "/", "/storage/emulated/0"),
-        new Pref("busybox",        "busybox for scripts",   "on", "off"),
         new Pref("verboseLog",     "verbose logging",       "off", "on"),
     };
 
-    // ---------------------------------------------------------------- colors
     // Stored as "#RRGGBB" strings, read straight out of prefs rather than
-    // through pget(), because pget only accepts values from a Pref's option
-    // list and a color is not a fixed list.
+    // through pget(), which only accepts a Pref's fixed option list.
     static final String K_BG     = "bgHex";
     static final String K_PS     = "psHex";
     static final String K_FG     = "fgHex";
@@ -538,14 +589,13 @@ public class TerminalActivity extends Activity {
         render();
     }
 
-    /**
-     * The background belongs to the whole window but depends on the current
-     * tab, so it has to be recomputed whenever the tab changes. Without this,
-     * starting PowerShell in one tab painted every other tab blue too, because
-     * nothing reset it when you switched away.
-     */
     private int lastBg = -1;
 
+    /**
+     * The background depends on the current tab, so it has to be recomputed when
+     * the tab changes: without this, starting PowerShell in one tab painted every
+     * other tab blue too.
+     */
     private void applyBg() {
         int c = bgColor();
         if (c == lastBg) return;      // append() renders constantly
@@ -663,9 +713,16 @@ public class TerminalActivity extends Activity {
         }
     }
 
-    /** interpreter used by 'run <script>' and the one-shot 'pwsh <cmd>' */
+    /**
+     * Interpreter used by 'run <script>' and the one-shot 'pwsh <cmd>'.
+     *
+     * /system/bin/sh (mksh) is always present and toybox covers the applets,
+     * so there is nothing else to choose. An explicit shebang in the script
+     * wins regardless, since this only supplies the interpreter for a bare
+     * script name.
+     */
     private String scriptShell() {
-        return pon("busybox", true) ? "/data/local/tmp/busybox sh " : "sh ";
+        return "sh ";
     }
 
     /** text form, for when the panel is not what you want */
@@ -888,85 +945,6 @@ public class TerminalActivity extends Activity {
 
         // seed the preview with the current value
         prev.setTextColor(cur);
-    }
-
-    private void paintPadTarget(TextView which, String[] names, EditText[] targets, int sel) {
-        which.setText("typing into: " + names[sel]);
-        which.setTextColor(0xFFCCCCCC);
-        for (int i = 0; i < targets.length; i++) {
-            targets[i].setBackgroundColor(i == sel ? 0xFF243040 : 0xFF151515);
-        }
-    }
-
-    /**
-     * Digit pad for the port and the pairing code. Both are pure numbers and
-     * summoning the headset soft keyboard to type five digits is miserable, so
-     * these get real buttons. The IP field deliberately keeps the normal
-     * keyboard because it is not numeric.
-     */
-    private LinearLayout numPad(final String[] names, final EditText[] targets,
-                                final int[] maxLen) {
-        final int[] sel = { 0 };
-        LinearLayout wrap = new LinearLayout(this);
-        wrap.setOrientation(LinearLayout.VERTICAL);
-
-        final TextView which = new TextView(this);
-        which.setTextSize(11);
-        which.setGravity(Gravity.CENTER);
-        which.setPadding(0, dp(4), 0, dp(4));
-        wrap.addView(which);
-
-        final String[] KEYS = { "1", "2", "3", "4", "5", "6",
-                                 "7", "8", "9", "DEL", "0", "CLR" };
-        for (int r = 0; r < 4; r++) {
-            LinearLayout row = new LinearLayout(this);
-            row.setOrientation(LinearLayout.HORIZONTAL);
-            for (int c = 0; c < 3; c++) {
-                final String k = KEYS[r * 3 + c];
-                TextView b = new TextView(this);
-                b.setText(k);
-                b.setTextSize(16);
-                b.setTextColor(0xFFEDEDF2);
-                b.setGravity(Gravity.CENTER);
-                b.setBackgroundColor(0xFF2A2A2A);
-                b.setOnClickListener(new View.OnClickListener() {
-                    public void onClick(View v) {
-                        EditText t = targets[sel[0]];
-                        String cur = t.getText().toString();
-                        if (k.equals("DEL")) {
-                            if (cur.length() > 0) {
-                                t.setText(cur.substring(0, cur.length() - 1));
-                            }
-                        } else if (k.equals("CLR")) {
-                            t.setText("");
-                        } else if (cur.length() < maxLen[sel[0]]) {
-                            t.setText(cur + k);
-                        }
-                        // keep the caret at the end, or a stale cursor position
-                        // makes the next digit land in the middle
-                        t.setSelection(t.getText().length());
-                    }
-                });
-                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(46), 1f);
-                lp.rightMargin = dp(4);
-                row.addView(b, lp);
-            }
-            wrap.addView(row);
-        }
-
-        // tapping a field aims the pad at it instead of opening a keyboard
-        for (int i = 0; i < targets.length; i++) {
-            final int k = i;
-            targets[i].setFocusable(false);
-            targets[i].setOnClickListener(new View.OnClickListener() {
-                public void onClick(View v) {
-                    sel[0] = k;
-                    paintPadTarget(which, names, targets, k);
-                }
-            });
-        }
-        paintPadTarget(which, names, targets, 0);
-        return wrap;
     }
 
     private static final String[][] COLOR_KEYS = {
@@ -1336,17 +1314,6 @@ public class TerminalActivity extends Activity {
         });
         bar.addView(sysBtn, new LinearLayout.LayoutParams(dp(56), dp(48)));
 
-        TextView adbBtn = new TextView(this);
-        adbBtn.setText("ADB");
-        adbBtn.setTextColor(0xFFEDEDF2);
-        adbBtn.setTextSize(11);
-        adbBtn.setGravity(Gravity.CENTER);
-        adbBtn.setBackgroundColor(0xFF2A2A2A);
-        adbBtn.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) { showAdbDialog(); }
-        });
-        bar.addView(adbBtn, new LinearLayout.LayoutParams(dp(56), dp(48)));
-
         // permissions as a button, because the grant can be revoked by accident
         // and hunting for a command on a headset keyboard is the wrong way to
         // find out whether the shell is actually there
@@ -1408,10 +1375,8 @@ public class TerminalActivity extends Activity {
     }
 
     private void append(String s) {
-        // Every view lives on the main looper. Shell callbacks are already
-        // posted there, but a builtin invoked from a worker thread would
-        // otherwise take the whole app down with a view-off-thread crash, so
-        // hop instead of exploding.
+        // Views live on the main looper, so hop instead of crashing with a
+        // view-off-thread exception.
         if (offUi()) {
             final String t = s;
             UI.post(new Runnable() {
@@ -1480,7 +1445,8 @@ public class TerminalActivity extends Activity {
         Session s = new Session();
         s.title = "sh" + (sessions.size() + 1);
         s.cwd = pget("startDir", "/");
-        s.buf.append(headset() + " - uid 2000 shell via Shizuku/ByteZuku\n"
+        s.uid = sh == null ? 2000 : sh.uid();
+        s.buf.append(headset() + " - " + transportLine() + "\n"
                    + "type 'help' for the full command list\n\n");
         sessions.add(s);
         current = sessions.size() - 1;
@@ -1488,14 +1454,11 @@ public class TerminalActivity extends Activity {
     }
 
     /**
-     * Verbs that stay local even while a PowerShell session is live.
-     *
-     * Without this list, anything typed in a PS session gets handed to
-     * PowerShell, which is wrong for most of these: 'prefs' and 'info' are UI
-     * and shell-inspection things PowerShell knows nothing about, and 'pkg'
-     * generates a busybox sh script that PowerShell would try to parse as its
-     * own. cd is here too, because doCd moves PowerShell's location itself and
-     * then reads it back, so the prompt cannot drift out of sync.
+     * Verbs that stay local even while a PowerShell session is live. Without
+     * this, anything typed in a PS session gets handed to PowerShell: the
+     * UI and shell-inspection verbs mean nothing there, and PowerShell would
+     * try to parse the sh script that 'pkg' generates. cd is local
+     * because doCd moves PowerShell's location itself and reads it back.
      */
     private static boolean localInPs(String verb) {
         return verb.equals("clear") || verb.equals("cls") || verb.equals("exit")
@@ -1508,16 +1471,20 @@ public class TerminalActivity extends Activity {
             || verb.equals("prefs") || verb.equals("pref") || verb.equals("colors")
             || verb.equals("color") || verb.equals("cheatsheet") || verb.equals("dev")
             || verb.equals("checkshizuku") || verb.equals("adbd")
+            || verb.equals("adbsetup")
+            || verb.equals("adbtcpip") || verb.equals("adbwireless")
+            || verb.equals("adbroot") || verb.equals("adbdev")
+            || verb.equals("adbhint") || verb.equals("adbh")
+            || verb.equals("adbuse") || verb.equals("adbshizuku")
             || verb.equals("info") || verb.equals("rootcheck") || verb.equals("commands")
             || verb.equals("pkg") || verb.equals("run") || verb.equals("su")
             || verb.equals("pwshfile") || verb.equals("pwshdemo");
     }
 
     /**
-     * The adb cheat sheet, translated for a terminal that is already on the
-     * device. Everything host-side (adb install, adb push, fastboot, the bash
-     * xargs tricks) is dropped, because you would run that on the PC, not here.
-     * What is left is the half that is actually useful from in here.
+     * The adb sheet, translated for a terminal already on the device: host-side
+     * things (adb install, fastboot, the bash xargs tricks) are dropped, since
+     * you would run those on the PC.
      */
     private void doCheatsheet(Session s) {
         append(
@@ -1738,11 +1705,8 @@ public class TerminalActivity extends Activity {
     private static final String CMD_SEP = "__BBSEP__";
 
     /**
-     * List everything the headset's shell can actually run. Walks $PATH the way
-     * the shell does, so the answer matches what you can just type, rather than
-     * a hardcoded list that would rot the first time the ROM changed.
-     *
-     * `commands` prints the lot, `commands grep` filters it.
+     * Walk $PATH the way the shell does, so the list matches what you can just
+     * type. `commands` prints it all, `commands grep` filters.
      */
     private void doCommands(final String arg, final Session s) {
         if (sh == null) { append("no shell yet - need shizuku access (checkshizuku)\n"); return; }
@@ -1837,11 +1801,9 @@ public class TerminalActivity extends Activity {
     // ------------------------------------------------------- shizuku verdict
 
     /**
-     * The one command that answers "did shizuku say yes or no" plainly. It
-     * separates the three states people conflate -- manager not running, access
-     * denied, and access granted but the UserService not bound -- because the
-     * fix is different for each. Also notes the flapping, since a denied read
-     * right after a launch is often just a stale sample.
+     * The command that answers "did shizuku say yes or no": it separates
+     * manager-not-running, access-denied, and access-granted-but-service-not-
+     * bound, because the fix differs for each.
      */
     private void doCheckShizuku(final Session s) {
         append("shizuku check\n" + Shell.status());
@@ -1891,12 +1853,9 @@ public class TerminalActivity extends Activity {
 
     // ------------------------------------------------------------ powershell
 
-
     /**
-     * Bring up a real persistent PowerShell session: one pwsh process on the
-     * far side that keeps its variables, modules and working directory between
-     * lines. Switches the console to the PowerShell blue and prints the banner
-     * people expect, then the prompt becomes a PS one.
+     * Bring up a persistent PowerShell session: one pwsh process on the far side
+     * that keeps its variables, modules and working directory between lines.
      */
     private void doPwshStart(final Session s) {
         if (sh == null) { append("no shell transport\n"); return; }
@@ -1906,7 +1865,7 @@ public class TerminalActivity extends Activity {
         sh.psStart(new Shell.Raw() {
             public void got(String o) {
                 s.busy = false;
-                if (o == null || o.startsWith("pwsh start failed")) {
+                if (o == null || !o.startsWith("BB|")) {
                     append((o == null ? "pwsh start failed" : o) + "\n");
                     render();
                     return;
@@ -1916,14 +1875,40 @@ public class TerminalActivity extends Activity {
                 s.title = "pwsh";
                 s.buf.replace(0, s.buf.length(), "");
                 if (pon("psBanner", true)) {
-                    s.buf.append("Windows PowerShell\n"
-                            + "Copyright (C) Microsoft Corporation. All rights reserved.\n"
-                            + "\n");
+                    s.buf.append(psBanner(o));
                 }
                 render();
                 appendPrompt();
             }
         });
+    }
+
+    /**
+     * The pwshstart banner, built from the version probe ShellService ran while
+     * starting the session. A hardcoded "Windows PowerShell" would be wrong
+     * twice over: this is pwsh on linux-arm64, not Windows PowerShell 5.1, and
+     * the version is whatever the user actually has installed.
+     */
+    private String psBanner(String probe) {
+        String ver = "unknown", edition = "Unknown", os = "";
+        String[] p = probe == null ? new String[0] : probe.split("\\|", -1);
+        if (p.length >= 5 && p[0].trim().equals("BB")) {
+            ver = p[1].trim();
+            edition = p[2].trim();
+            // OS reads "Linux 5.15.94-android14-8-..."; the first token is the
+            // part worth a banner, the kernel string wraps on a headset screen.
+            os = p[3].trim().split("\\s")[0];
+            if (ver.length() == 0) ver = "unknown";
+            if (edition.length() == 0) edition = "Unknown";
+        }
+        StringBuilder b = new StringBuilder();
+        b.append("Quest PowerShell\n");
+        b.append("PowerShell ").append(ver).append(" (").append(edition).append(')');
+        if (os.length() > 0) b.append(" on ").append(os);
+        b.append('\n');
+        b.append("Microsoft (C) All rights reserved.\n");
+        b.append('\n');
+        return b.toString();
     }
 
     private void doPwshStop(final Session s) {
@@ -1991,9 +1976,11 @@ public class TerminalActivity extends Activity {
                     + " -> " + translate(verb, arg, cmd));
         }
         if (sh == null) {
-            // No Shizuku/ByteZuku service. Fall back to the in-process adb
-            // transport rather than refusing to run anything.
-            runViaAdb(cmd, verb, arg, ss);
+            // No transport at all. The adbsetup hint is the honest answer,
+            // because a command cannot run until a transport exists.
+            ss.busy = false;
+            appendNoShell();
+            appendPrompt();
             return;
         }
         final String real = translate(verb, arg, cmd);
@@ -2006,10 +1993,8 @@ public class TerminalActivity extends Activity {
     }
 
     /**
-     * Upstream PowerShell only ships linux-arm64, but Android is Bionic, so the
-     * binary cannot be exec'd directly. /data/local/tmp/pwsh/pwsh.sh launches it
-     * through Debian's aarch64 glibc loader, which makes PowerShell just another
-     * command on whichever transport is live.
+     * Upstream pwsh is linux-arm64 glibc and Android is Bionic, so pwsh.sh
+     * launches it through Debian's glibc loader rather than exec'ing it.
      */
     private static final String PWSH = ShellService.PWSH;
 
@@ -2041,70 +2026,272 @@ public class TerminalActivity extends Activity {
                  + "; echo \"state:    $(getprop init.svc.adbd)\""
                  + "; echo \"listening: $(cat /proc/net/tcp6 | grep -c 15B3)\"";
         }
-        // busybox applets resolve through its own argv[0]
-        if (!cmd.contains("/") && isBusyboxApplet(verb)) {
-            return ShellService.BUSYBOX + " " + cmd;
-        }
+        // No busybox rewriting: the device's toybox (/system/bin) answers the
+        // common applets as typed, exactly like a normal shell would.
         return cmd;
     }
 
-    /**
-     * Run a command over the in-process adb transport. Uses the same reply
-     * plumbing as the Shizuku path so the terminal behaves identically.
-     */
-    private void runViaAdb(final String cmd, final String verb, final String arg, final Session ss) {
-        if (adbKey == null || adbHost == null) {
-            append("no shell transport\n"
-                 + "Shizuku/ByteZuku is unavailable and no adb link is open.\n"
-                 + "Tap ADB, enter ip + port, press CONNECT.\n");
-            ss.busy = false;
+    // ------------------------------------------------------------ adb builtins
+    // A real adb, shipped as lib/arm64-v8a/libadb.so and run from the app's own
+    // nativeLibraryDir. Unlike the in-process protocol it can pair, so it can be
+    // authorised, and on a userdebug build it can ask adbd to restart as root.
+
+    private void adbJob(final Session s, final java.util.concurrent.Callable<String> job) {
+        if (!AdbBin.available(this)) {
+            append("this build carries no adb client (lib/arm64-v8a/libadb.so).\n");
             return;
         }
-        ss.worker = new Thread(new Runnable() {
+        s.busy = true;
+        new Thread(new Runnable() {
             public void run() {
                 String out;
-                AdbLink link = new AdbLink(adbKey);
                 try {
-                    if (!link.connect(adbHost, adbPort)) {
-                        out = "adb connect failed\n" + link.lastLog();
-                    } else {
-                        out = link.exec(translate(verb, arg, cmd), 15000);
-                    }
+                    out = job.call();
                 } catch (Throwable t) {
-                    out = "adb error: " + t;
-                } finally {
-                    link.close();
+                    out = "error: " + t;
                 }
-                final String fin = out;
+                final String fin = out == null ? "" : out;
                 post(new Runnable() {
                     public void run() {
-                        append(fin.isEmpty() ? "(no output)\n" : fin);
-                        ss.busy = false;
+                        s.busy = false;
+                        if (fin.length() > 0) append(fin.endsWith("\n") ? fin : fin + "\n");
+                        appendPrompt();
+                        render();
                     }
                 });
             }
-        });
-        ss.worker.start();
+        }, "bbterm-adbjob").start();
     }
 
-    // ---- prompt ----------------------------------------------------------
-    // cmd-style with a drive letter, led by the headset's own codename, so the
-    // prompt is right on every headset instead of hardcoding one of them:
-    //     C:\eureka\>       Quest 3
-    //     C:\hollywood\>    Quest 2S
-    //     C:\batlleeye\>    Quest 2
-    // The glyph is $ for an ordinary uid 2000 shell and # once su granted root:
-    //     C:\eureka\$>      C:\eureka\#>
-    //     eureka $:\>       the same thing unix-flavoured
-    // 'prompt' cycles the three styles at runtime.
+    private AdbBin adbBin(String device) {
+        return new AdbBin(this, device);
+    }
+
+    private static String loopback(int port) {
+        return "127.0.0.1:" + port;
+    }
+
+    /**
+     * adbsetup <pairport> <code> [port]: the whole flow, since the steps depend
+     * on each other and doing them by hand means reading a number off one screen
+     * and typing it into another. Pair over loopback, connect, pin adbd to 5555
+     * so the port stops moving every boot, reconnect, then ask for root.
+     *
+     * A client is bound to one address and every -s call and isOnline() check
+     * uses it, so pairing and running need separate instances: the pairing port
+     * is a TLS socket that closes when pairing ends, and a client pointed at it
+     * reports the connect port as offline forever.
+     */
+    private void doAdbSetup(String arg, final Session s) {
+        final String[] a = arg == null ? new String[0] : arg.trim().split("\\s+");
+        if (a.length < 2) { append(adbHelpText()); return; }
+        final int pp = posInt(a[0]);
+        final String code = a[1];
+        if (pp <= 0) { append("bad pairing port: " + a[0] + "\n"); return; }
+        final int dp = a.length > 2 ? posInt(a[2]) : adbDevicePort();
+
+        adbJob(s, new java.util.concurrent.Callable<String>() {
+            public String call() {
+                StringBuilder sb = new StringBuilder();
+                AdbBin pairer = adbBin(loopback(pp));
+                sb.append("$ adb pair ").append(loopback(pp)).append(' ').append(code).append('\n');
+                String pairOut = pairer.pair(pp, code);
+                sb.append(pairOut);
+                if (!pairOut.toLowerCase(java.util.Locale.US).contains("success")) {
+                    sb.append("\npairing did not complete. both the code and the port come\n"
+                            + "off the wireless debugging screen, and the pair port changes\n"
+                            + "every time you ask for a new code.\n");
+                    return sb.toString();
+                }
+                AdbBin b = adbBin(loopback(dp));
+                sb.append("\n$ adb connect ").append(loopback(dp)).append('\n');
+                sb.append(b.connect(loopback(dp)));
+                // First contact with this key makes the headset raise its own
+                // 'allow debugging' panel, and the user is wearing the thing:
+                // wait for the tap instead of racing it.
+                StringBuilder auth = new StringBuilder();
+                if (!b.authorizeAndWait(90000, auth)) {
+                    sb.append("\nconnect did not take. device list:\n").append(b.devices());
+                    if (auth.length() > 0) sb.append(auth);
+                    sb.append("\n'unauthorized' means the headset is still showing the\n"
+                            + "'allow debugging' prompt: accept it on the device, then run\n"
+                            + "this again. adbd restarts once accepted, so a retry is normal.\n");
+                    return sb.toString();
+                }
+                if (auth.length() > 0) sb.append('\n').append(auth);
+                sb.append("\ntransport authorized as ").append(b.device()).append('\n');
+                sb.append("\n$ adb -s ").append(loopback(dp)).append(" tcpip 5555\n");
+                sb.append(b.tcpip(5555));
+                AdbBin pinned = adbBin(loopback(5555));
+                sb.append(pinned.connect(loopback(5555)));
+                if (!pinned.waitOnline(10000)) {
+                    sb.append("\nadbd did not come back on 5555. device list:\n")
+                      .append(pinned.devices());
+                    return sb.toString();
+                }
+                final String dev = loopback(5555);
+                sb.append("\nusing ").append(dev).append('\n');
+                String rootOut = pinned.adbRoot();
+                if (rootOut.length() > 0) sb.append(rootOut);
+                pinned.connect(dev);
+                String who = AdbBin.firstLine(pinned.shell("whoami"));
+                if (!"root".equals(who)) {
+                    pinned.connect(dev);
+                    who = AdbBin.firstLine(pinned.shell("whoami"));
+                }
+                if ("root".equals(who)) {
+                    sb.append("shell uid: root, uid 0\n");
+                } else {
+                    // adbd only restarts as root on a userdebug build, so on a
+                    // retail headset this is the expected answer, not a fault.
+                    sb.append("shell uid: ").append(who.length() > 0 ? who : "unknown")
+                      .append("  (adbd stays non-root on a production build;")
+                      .append(" 'su' or Shizuku is the way to uid 0)\n");
+                }
+                post(new Runnable() {
+                    public void run() {
+                        pput("adbDev", dev);
+                        adoptAdb(dev);
+                        render();
+                    }
+                });
+                return sb.toString();
+            }
+        });
+    }
+
+    /**
+     * adbtcpip [port]. With a transport up this is one adb call; without one,
+     * root does the same job by hand. That is the only way to pin the port
+     * before any transport exists, and what makes a paired device come back on
+     * the same port after a reboot.
+     */
+    private void doAdbTcpip(String arg, final Session s) {
+        final int port = posInt(arg);
+        final String dev = pget("adbDev", loopback(adbDevicePort()));
+        adbJob(s, new java.util.concurrent.Callable<String>() {
+            public String call() {
+                StringBuilder sb = new StringBuilder();
+                AdbBin b = adbBin(dev);
+                if (b.isOnline()) {
+                    sb.append("$ adb -s ").append(dev).append(" tcpip ").append(port).append('\n');
+                    sb.append(b.tcpip(port)).append('\n');
+                    b.connect(loopback(port));
+                    if (b.isOnline()) {
+                        final String use = loopback(port);
+                        post(new Runnable() {
+                            public void run() {
+                                pput("adbDev", use);
+                                adoptAdb(use);
+                                render();
+                            }
+                        });
+                    }
+                    return sb.toString();
+                }
+                sb.append("no adb link yet, trying the root way\n");
+                if (suT == null) {
+                    sb.append("no root either. run 'su' first and this will do it for\n"
+                            + "you, or do it from a PC:\n\n  adb -s ").append(dev)
+                      .append(" tcpip ").append(port).append('\n');
+                    return sb.toString();
+                }
+                String cmd = "setprop service.adb.tcp.port " + port
+                        + "; stop adbd; start adbd; sleep 2; getprop service.adb.tcp.port";
+                sb.append(cmd).append('\n');
+                Su.Result r = Su.run(suT.suPath(), cmd, null, 30000);
+                sb.append(r.out.length() > 0 ? r.out : r.err).append('\n');
+                b.connect(loopback(port));
+                if (b.isOnline()) {
+                    final String use = loopback(port);
+                    post(new Runnable() {
+                        public void run() {
+                            pput("adbDev", use);
+                            adoptAdb(use);
+                            render();
+                        }
+                    });
+                }
+                return sb.toString();
+            }
+        });
+    }
+
+    private void doAdbRoot(final Session s) {
+        final String dev = pget("adbDev", loopback(adbDevicePort()));
+        adbJob(s, new java.util.concurrent.Callable<String>() {
+            public String call() {
+                AdbBin b = adbBin(dev);
+                if (!b.isOnline()) return "no adb link to " + dev + ".\n";
+                StringBuilder sb = new StringBuilder("$ adb -s ").append(dev).append(" root\n");
+                sb.append(b.adbRoot()).append('\n');
+                b.connect(dev);
+                String who = AdbBin.firstLine(b.shell("whoami"));
+                sb.append("shell uid: ").append(who).append('\n');
+                if ("root".equals(who)) {
+                    sb.append("this build lets adbd restart as root, so uid 0 needs no\n"
+                            + "root manager at all.\n");
+                } else {
+                    sb.append("ro.debuggable is not set, so adbd will not restart as root.\n"
+                            + "the shell stays uid 2000; 'su' is the way to root on a\n"
+                            + "stock build.\n");
+                }
+                return sb.toString();
+            }
+        });
+    }
+
+    /** what the bundled client can see, for when pairing is not working */
+    private void doAdbDev(final Session s) {
+        final android.content.Context ctx = this;
+        adbJob(s, new java.util.concurrent.Callable<String>() {
+            public String call() {
+                AdbBin b = adbBin(pget("adbDev", loopback(adbDevicePort())));
+                java.io.File key = new java.io.File(AdbBin.homeDir(ctx), ".android/adbkey");
+                return "binary:    " + AdbBin.binaryPath(ctx) + "\n"
+                        + "version:   " + AdbBin.version(ctx).replace('\n', ' ') + "\n"
+                        + "HOME:      " + AdbBin.homeDir(ctx) + "\n"
+                        + "key file:  " + (key.isFile() ? "present" : "not generated yet") + "\n"
+                        + "devices:\n" + b.devices() + "\n"
+                        + "port prop: " + adbDevicePort() + "\n";
+            }
+        });
+    }
+
+    /** go back to Shizuku without touching anything else */
+    private void doAdbUse(String arg, final Session s) {
+        if (shCbReady == null) {
+            append("no Shizuku/ByteZuku connection to go back to. run checkshizuku.\n");
+            return;
+        }
+        setTransport(shCbReady, "shizuku: connected (uid 2000 shell)");
+        append("back on " + transportLine() + "\n");
+        render();
+    }
+
+    /** first integer in a string, or the fallback; 0 means "not given" */
+    private static int posInt(String s) {
+        if (s == null) return 0;
+        for (String tok : s.trim().split("\\s+")) {
+            try {
+                int v = Integer.parseInt(tok);
+                if (v > 0) return v;
+            } catch (Throwable ignored) { }
+        }
+        return 0;
+    }
+
+    // ----------------------------------------------------------------- prompt
+    // cmd-style with a drive letter, led by the headset's own codename so it is
+    // right on every headset: C:\eureka\>, C:\hollywood\>, C:\batlleeye\>. The
+    // glyph is $ for uid 2000 and # once su has granted root; 'prompt' cycles
+    // the three styles at runtime.
     private static final String[] PROMPT_STYLES = { "cmd", "plain", "unix" };
     private int promptStyle = 0;
 
     /**
-     * Device codename, read from the device rather than assumed. Quest 3 is
-     * eureka, Quest 2S is hollywood, Quest 2 is batlleeye, so a hardcoded name
-     * would be wrong on two out of three. Cached in prefs because the prompt
-     * needs it synchronously and getprop is not.
+     * Read from the device and cached in prefs, because the prompt needs it
+     * synchronously and getprop is not.
      */
     private volatile String codename = "";
 
@@ -2115,10 +2302,9 @@ public class TerminalActivity extends Activity {
     }
 
     /**
-     * Codename -> retail name. ro.product.model is unreliable on these builds
-     * (it can read back a generic string), so the codename is the honest
-     * identifier and this table turns it into something a human recognises.
-     * An unknown codename is shown raw rather than guessed at.
+     * Codename -> retail name. ro.product.model reads back a generic string on
+     * these builds, so the codename is the honest identifier; an unknown one is
+     * shown raw rather than guessed at.
      */
     private static final String[][] HEADSETS = {
         { "eureka",    "Quest 3"    },
@@ -2175,11 +2361,8 @@ public class TerminalActivity extends Activity {
     }
 
     /**
-     * Map a posix cwd onto a drive letter, the way cmd would show it:
-     *   C: = the device itself, whose root is displayed as \<codename>\
-     *   D: = /storage/emulated/0, the shared volume
-     *   E: = the tool prefix this app owns
-     * Anything not under D: or E: is a path on C: below \<codename>\.
+     * posix cwd -> drive letter, cmd style: C: is the device root (drawn as
+     * \<codename>\), D: is /storage/emulated/0, E: is the tool prefix.
      */
     private String winPath(String cwd) {
         String w = (cwd == null || cwd.isEmpty()) ? "/" : cwd;
@@ -2245,30 +2428,17 @@ public class TerminalActivity extends Activity {
             if (out != null && out.length() > 0) append(out);
             if (err != null && err.length() > 0) append(err);
             if (code != 0) append("[exit " + code + "]\n");
-            // NB: do not try to track cd by asking pwd here. Every command runs
-            // in its own 'sh -c', so a separate pwd can only report that
-            // process's directory, not where the command left off - and asking
-            // via execRaw, which has no cwd, reported the service's default
-            // directory and overwrote s.cwd after every single command, undoing
-            // cd entirely. The cd builtin is the only writer of s.cwd now.
+            // Do not track cd by asking pwd here: every command runs in its own
+            // 'sh -c', so a separate pwd can only report that process's
+            // directory and would overwrite s.cwd, undoing cd. The cd builtin is
+            // the only writer of s.cwd now.
             //
-            // This is also the completion handler for every exec, so it is
-            // where the next prompt belongs. Without it the terminal just
-            // stopped after a command and looked hung - you had to press enter
-            // to get a prompt back, which is what made cd look like it had
-            // broken the app.
+            // This is also the completion handler for every exec, so the next
+            // prompt belongs here - without it the terminal looked hung after a
+            // command until you pressed enter.
             appendPrompt();
             return;
         }
-    }
-
-    private boolean isBusyboxApplet(String v) {
-        String[] common = {"awk", "sed", "grep", "find", "xxd", "base64", "nc", "tar",
-                           "curl", "wget", "ps", "top", "hexdump", "stat", "du", "df",
-                           "ls", "cat", "cp", "mv", "rm", "mkdir", "head", "tail",
-                           "sort", "uniq", "wc", "tr", "cut", "date", "env"};
-        for (String c : common) if (c.equals(v)) return true;
-        return false;
     }
 
     /** returns true if the command was handled locally */
@@ -2349,6 +2519,12 @@ public class TerminalActivity extends Activity {
         }
         if (verb.equals("su")) { doSu(arg, s); return true; }
         if (verb.equals("askforsu") || verb.equals("asksu")) { doAskSu(s); return true; }
+        if (verb.equals("adbsetup")) { doAdbSetup(arg, s); return true; }
+        if (verb.equals("adbtcpip") || verb.equals("adbwireless")) { doAdbTcpip(arg, s); return true; }
+        if (verb.equals("adbroot")) { doAdbRoot(s); return true; }
+        if (verb.equals("adbdev")) { doAdbDev(s); return true; }
+        if (verb.equals("adbhint") || verb.equals("adbh")) { append(adbHelpText()); return true; }
+        if (verb.equals("adbuse") || verb.equals("adbshizuku")) { doAdbUse(arg, s); return true; }
         if (verb.equals("info")) { append(infoText(s)); return true; }
         if (verb.equals("rootcheck")) { append(rootText()); return true; }
         if (verb.equals("adbhelp") || verb.equals("settings")) {
@@ -2370,14 +2546,10 @@ public class TerminalActivity extends Activity {
     }
 
     /**
-     * cd has to be a builtin. Handing it to the shell is pointless: every
-     * command here runs in a fresh `sh -c`, so a `cd` executed there moves that
-     * process's directory and then the process exits, taking the change with
-     * it. The session's cwd is the only directory that persists, so cd has to
-     * update it and the next command has to be launched from it.
-     *
-     * Accepts what a shell accepts, plus the drive-letter paths this prompt
-     * displays, because the prompt says "D:\Music\" and people then type it.
+     * cd must be a builtin: every command runs in a fresh `sh -c`, so a `cd`
+     * executed there moves that process's directory and dies with it. The
+     * session cwd is the only directory that persists, and cd accepts the
+     * drive-letter paths this prompt displays, since people then type them.
      */
     private void doCd(String arg, final Session s) {
         if (sh == null) { append("no shell\n"); return; }
@@ -2471,23 +2643,6 @@ public class TerminalActivity extends Activity {
     }
 
     /**
-     * The shared volume has several names and they are all the same place:
-     *
-     *   /sdcard              -> /storage/self/primary
-     *   /storage/self/primary -> /storage/emulated/0
-     *
-     * The shell happily accepts any of them, and pwd reports back whichever one
-     * you typed. That matters here because the prompt is derived from the
-     * session directory: leaving it as /sdcard/Download would draw a nonsense
-     * C:\sdcard\Download\ instead of the D:\ it actually is. So rewrite the
-     * alias to the real path before anything else looks at it.
-     *
-
-    /**
-     * su is a registered builtin, not a fake button. With no root it says so
-     * plainly; with root present the same command works unchanged.
-     */
-    /**
      * pwshdemo: prove the live PowerShell session end to end from the prompt,
      * without typing several things and having to remember the order. Each step
      * is a separate psLine, so it also exercises the request/response path the
@@ -2536,11 +2691,9 @@ public class TerminalActivity extends Activity {
 
     /**
      * apkinstall: the adb install flags, run through the shell we already have.
-     *
-     * 'apkinstall -r -g - some.apk' needs the apk on stdin, because pm cannot
-     * read one off /storage/emulated/0 - the sdcard is FUSE and the package
-     * manager streams the file through a pipe, which fails there. That means
-     * reading the file and handing it over, rather than sending a command line.
+     * The apk travels on stdin ('apkinstall -r -g - some.apk') because pm
+     * cannot read one off /storage/emulated/0 - the sdcard is FUSE and pm
+     * streams the file through a pipe, which fails there.
      */
     private void doApkInstall(String arg, final Session s) {
         if (sh == null) { append("no shell yet\n"); return; }
@@ -2630,230 +2783,90 @@ public class TerminalActivity extends Activity {
     }
 
     /**
-     * Build the su probe.
-     *
-     * The thing that triggers the manager's prompt is the su binary itself, at
-     * whatever path it lives on - so each candidate is invoked by its own
-     * absolute path, not by hoping `su` is on $PATH. A device can have su at
-     * /product/bin/su with nothing named su on the PATH at all, so an earlier
-     * version that detected the path and then ran a bare `su` could find a
-     * binary and still ask the wrong one.
-     *
-     * Order is chosen by which daemon is actually running, because that is
-     * what tells us whose su is the live one:
-     *
-     *   magiskd   -> /product/bin/su and /system/bin/su. /product is a real
-     *                partition on modern Android and the stock su lives there,
-     *                with Magisk magic-mounting over it, so it is usually the
-     *                first hit rather than the legacy path it looks like.
-     *   ksud      -> /debug_ramdisk/su and /data/adb/ksu/bin/su, which is
-     *                where KernelSU puts it. Neither is on the normal PATH.
-     *   apd       -> APatch's own location.
-     *
-     * Everything else is still tried afterwards, in a fixed order, so an
-     * unrecognised manager or an unusual layout still gets found. The first
-     * candidate that answers 0 wins and stops the walk, because each attempt
-     * can block for the full timeout while the manager waits for the user -
-     * trying all of them at 30s each would be minutes of nothing.
+     * 'su [command]': probe root, then run the rest of the line as root over the
+     * root transport. The probe runs in this process rather than over the shell
+     * transport: a su request made as uid 2000 is recorded by Magisk/KernelSU
+     * against "shell", so root looked granted while the app's own commands got
+     * nothing. Requested from the app's own uid it is recorded against this
+     * package, which is the entry the user can see and revoke.
      */
-    private static String suProbe(int timeoutSec) {
-        return "BB=" + ShellService.BUSYBOX + "; "
-             + "try_su() { "
-             + "  _p=$1; "
-             + "  [ -e \"$_p\" ] || return 0; "
-             + "  if command -v timeout >/dev/null 2>&1; then "
-             + "    _o=$(timeout " + timeoutSec + " \"$_p\" -c 'id -u' 2>&1 | head -1); "
-             + "  else "
-             + "    _o=$(\"$_p\" -c 'id -u' 2>&1 | head -1); "
-             + "  fi; "
-             + "  echo \"ATT $_p :: $_o\"; "
-             + "  case \"$_o\" in 0*) exit 0;; esac; "
-             + "  return 0; "
-             + "}; "
-             + "M=; C=; "
-             + "if pidof magiskd >/dev/null 2>&1; then M=magisk; "
-             + "C=\"/product/bin/su /system/bin/su /system/xbin/su\"; fi; "
-             + "if pidof ksud >/dev/null 2>&1; then M=kernelsu; "
-             + "C=\"/debug_ramdisk/su /data/adb/ksu/bin/su $C\"; fi; "
-             + "if pidof apd >/dev/null 2>&1; then M=apatch; fi; "
-             + "[ -n \"$M\" ] && echo \"MGR $M\"; "
-             + "echo 'TRYBEGIN'; "
-             + "for p in $C /product/bin/su /system/bin/su /system/xbin/su "
-             + "/sbin/su /su/bin/su /debug_ramdisk/su /data/adb/ksu/bin/su "
-             + "/vendor/bin/su; do try_su \"$p\"; done; "
-             + "try_su \"$(command -v su 2>/dev/null)\"; "
-             + "echo 'TRYEND'";
-    }
-
-    private static final String SU_PROBE = suProbe(8);
-
-    /** results of parsing the probe output, so both entry points share the logic */
-    private static class SuResult {
-        String path;          // a su binary that exists
-        String manager;       // magisk / kernelsu / apatch, null if none
-        String said;          // what the winning su printed, "" if none did
-        int attempts = 0;     // how many candidates were actually run
-        boolean tried() { return !said.isEmpty(); }
-        boolean granted() { return said.trim().equals("0"); }
-        boolean present() { return path != null; }
-    }
-
-    private static SuResult parseSu(String o) {
-        SuResult r = new SuResult();
-        boolean inTry = false;
-        for (String line : (o == null ? "" : o).split("\\n")) {
-            String l = line.trim();
-            if (l.startsWith("MGR ")) { r.manager = l.substring(4).trim(); continue; }
-            if (l.equals("TRYBEGIN")) { inTry = true; continue; }
-            if (l.equals("TRYEND")) { inTry = false; continue; }
-            if (!inTry || !l.startsWith("ATT ")) continue;
-
-            // ATT <path> :: <reply>
-            String rest = l.substring(4);
-            int sep = rest.indexOf(" :: ");
-            if (sep < 0) continue;
-            String p = rest.substring(0, sep).trim();
-            String v = rest.substring(sep + 4).trim();
-            r.attempts++;
-            if (r.path == null && p.length() > 0) r.path = p;
-            // first non-empty reply wins; the script exits early on 0 anyway
-            if (r.said.isEmpty() && v.length() > 0) r.said = v;
-        }
-        return r;
+    private void doSu(final String arg, final Session s) {
+        startSuProbe(s, arg, 20000, true);
     }
 
     /**
-     * askforsu: deliberately ask the root manager for root, and wait long
-     * enough for you to approve it.
-     *
-     * 'su -c <cmd>' is the Magisk protocol; KernelSU and APatch answer the
-     * same call, so this asks whichever su is present rather than Magisk
-     * specifically, and reports which manager it found.
-     *
-     * Two things this has to get right, both learned the hard way:
-     *
-     * 1. 'command -v su' only searches $PATH, and the managers do not all put
-     *    su there. Magisk magic-mounts it at /system/bin/su, older Magisk used
-     *    /system/xbin/su, KernelSU uses /debug_ramdisk/su and
-     *    /data/adb/ksu/bin/su, APatch has its own. Checking only the PATH
-     *    version called rooted devices unrooted, which is what it did on
-     *    someone else's phone. So the real locations are checked too.
-     *
-     * 2. su blocks while the manager waits for approval, and the normal exec
-     *    path has no timeout, so an unattended su would hang the terminal
-     *    forever. Hence 'timeout' - short for a plain check, long here.
+     * 'askforsu': same probe on a long budget, since the manager is waiting for
+     * an approval tap. A short timeout reports "timed out" for "not yet".
      */
     private void doAskSu(Session s) {
-        if (sh == null) { append("no shell\n"); return; }
-        append("asking for root...\n");
-        append("if a prompt appears in your root manager, approve it.\n");
-        s.busy = true;
-        sh.execRaw(suProbe(30), new Shell.Raw() {
-            public void got(String o) {
-                s.busy = false;
-                SuResult r = parseSu(o);
-                if (r.path == null && r.manager == null) {
-                    append("\nno root to ask - no su binary anywhere, and no root\n"
-                         + "manager daemon is running. nothing to request.\n");
-                    append("checked: /product/bin/su /system/bin/su\n"
-                         + "         /system/xbin/su /sbin/su /su/bin/su\n"
-                         + "         /debug_ramdisk/su /data/adb/ksu/bin/su\n"
-                         + "         /vendor/bin/su, and $PATH\n");
-                    append("         /product/bin/su is the stock location on\n"
-                         + "         most modern Androids, which Magisk\n"
-                         + "         magic-mounts over, so it is tried first.\n");
-                    append("\nnot a problem: this terminal runs through Shizuku\n"
-                         + "as uid 2000 either way.\n");
-                    appendPrompt();
-                    return;
-                }
-                if (r.manager != null) append("  manager: " + r.manager + "\n");
-                if (r.path != null) append("  su:     " + r.path + "\n");
-                if (r.granted()) {
-                    append("\nroot granted, uid 0\n");
-                    s.uid = 0;                 // prompt glyph flips $ to #
-                    appendPrompt();
-                    return;
-                }
-                append("\nroot refused\n");
-                if (!r.tried()) {
-                    append("  su said nothing for 30s. it is probably still\n"
-                         + "  waiting for you, so check the root manager for an\n"
-                         + "  unanswered prompt.\n");
-                } else {
-                    append("  it said: " + r.said + "\n");
-                    append("  allow shell access in the manager's superuser\n"
-                         + "  list, then run askforsu again.\n");
-                }
-                append("  the terminal is unaffected, still uid 2000.\n");
-                appendPrompt();
-            }
-        });
+        startSuProbe(s, null, 60000, true);
     }
 
-    private void doSu(String arg, final Session s) {
-        if (sh == null) { append("no shell\n"); return; }
-        sh.execRaw(SU_PROBE, new Shell.Raw() {
-            public void got(String o) {
-                SuResult r = parseSu(o);
-                String uid = r.said;
-
-                // No root. This is not a problem to report, it is the normal
-                // case: everything in this app runs through Shizuku as uid
-                // 2000, and root was only ever a bonus.
-                if (r.path == null && r.manager == null) {
-                    append("no root on this device - no su, no root manager.\n");
-                    append("not a problem: everything here runs through\n"
-                         + "Shizuku as uid 2000. still working as normal.\n");
-                    append("\nroot would only add ptrace, /proc/<pid>/mem, and\n"
-                         + "writes outside the shared folders. 'askforsu' asks\n"
-                         + "properly and waits; 'rootcheck' lists where it looked.\n");
-                    return;
-                }
-
-                if (r.granted()) {
-                    append("root granted, uid 0\n");
-                    if (r.manager != null) append("  manager: " + r.manager + "\n");
-                    if (r.path != null) append("  su:     " + r.path + "\n");
-                    s.uid = 0;                 // prompt glyph flips $ to #
-                    if (arg != null && arg.length() > 0) {
-                        sh.exec("su -c " + q(arg));
-                    }
-                    render();
-                    return;
-                }
-
-                // su exists but did not hand over uid 0
-                append("root found, not granted\n");
-                if (r.manager != null) append("  manager: " + r.manager + "\n");
-                if (r.path != null) append("  su:     " + r.path + "\n");
-                if (!r.tried()) {
-                    append("  it did not answer. it is probably waiting for you\n"
-                         + "  to approve it in the root manager - look there, or\n"
-                         + "  it timed out after 8s. 'askforsu' waits longer.\n");
-                } else {
-                    append("  it said: " + r.said + "\n");
-                    append("  grant shell access in the root manager's superuser\n"
-                         + "  list, then run askforsu again.\n");
-                }
-                append("  nothing else is affected; still on Shizuku uid 2000.\n");
-                render();
+    private void startSuProbe(final Session s, final String arg,
+                              final int timeoutMs, final boolean announce) {
+        s.busy = true;
+        String mgr = Su.managerFor(pget("suPath", Su.find()));
+        final String[] cands = Su.candidates(mgr, pget("suPath", null));
+        if (announce) {
+            append("asking " + getPackageName() + " for root...\n");
+            append("approve it in your root manager if a prompt appears.\n");
+        }
+        new Thread(new Runnable() {
+            public void run() {
+                final Su.Probe p = Su.probe(cands, timeoutMs, 4);
+                post(new Runnable() {
+                    public void run() { onSuProbe(p, arg); }
+                });
             }
-        });
+        }, "bbterm-suprobe").start();
+    }
+
+    private void onSuProbe(Su.Probe p, String arg) {
+        for (Session s : sessions) s.busy = false;
+
+        if (p.status == Su.GRANTED) {
+            String mgr = Su.managerFor(p.path);
+            append("root granted, uid 0\n");
+            append("  su:      " + p.path + "\n");
+            if (mgr != null) append("  manager: " + mgr + "\n");
+            append("  grant is on " + getPackageName() + ", not on shell.\n");
+            adoptRoot(p.path);
+            if (arg != null && arg.length() > 0) sh.exec(arg);
+            render();
+            return;
+        }
+
+        if (!p.hadBinary) {
+            append("no root on this device - no su binary anywhere.\n");
+            append("not a problem. currently: " + transportLine() + "\n");
+            append("  'adbsetup' gets a uid 2000 shell with no root at all,\n"
+                 + "  and needs no root manager.\n");
+            appendPrompt();
+            return;
+        }
+
+        append("root found, not granted\n");
+        append("  su:      " + p.path + "\n");
+        String mgr = Su.managerFor(p.path);
+        if (mgr != null) append("  manager: " + mgr + "\n");
+        if (p.status == Su.TIMEOUT) {
+            append("  it said nothing for " + (p.note) + ". it is most likely\n"
+                 + "  holding a prompt open - look at the root manager.\n");
+        } else {
+            append("  it said: " + p.note + "\n");
+            append("  approve " + getPackageName() + " in the superuser list,\n"
+                 + "  then run su again.\n");
+        }
+        append("  nothing else changed; still " + transportLine() + ".\n");
+        render();
     }
 
     /**
-     * Everything the info panels want, in one round trip, as key=value lines.
-     *
-     * This used to be a probe() per value. probe() fired an async call and
-     * then slept 120ms hoping the answer had landed, but every callback is
-     * posted to the UI thread and the caller is *on* the UI thread, so the
-     * callback could not run until the caller returned. Every value therefore
-     * came back as the "?" placeholder. Batching also makes info one call
-     * instead of ten.
-     *
-     * Every value is read from the device. Nothing here is hardcoded to a
-     * particular headset or Android version.
+     * Everything the info panels want in one round trip, as key=value lines.
+     * This used to be one probe() per value, but probe()'s callback is posted to
+     * the UI thread the caller is already on, so nothing ever landed and every
+     * value came back "?". All values are read from the device; none is baked in
+     * for a particular headset or Android version.
      */
     private static final String FACTS_CMD =
               "echo model=$(getprop ro.product.model);"
@@ -2863,14 +2876,11 @@ public class TerminalActivity extends Activity {
             + " echo fingerprint=$(getprop ro.build.fingerprint);"
             + " echo serial=$(getprop ro.serialno);"
             + " echo uid=$(id -u);"
-            + " echo busybox=$(" + ShellService.BUSYBOX + " 2>/dev/null | head -1);"
+            + " echo toybox=$(command -v toybox 2>/dev/null || echo absent);"
             + " echo selinux=$(getenforce 2>/dev/null || echo unknown);"
-            // Root detection looks everywhere the managers actually put su.
-            // Checking only /product/bin/su called rooted devices unrooted,
-            // because that is one Magisk-era path and no longer where any of
-            // them keep it.
-            // 'exit' here ends only the $( ) subshell, so the first match wins
-            // and the "absent" default still runs when nothing matched
+            // Check every path the managers actually use: /product/bin/su alone
+            // called rooted devices unrooted. 'exit' ends only the $( ) subshell,
+            // so the first match wins and the fallback runs when none matched.
             + " echo su=$(for p in /system/bin/su /system/xbin/su /sbin/su"
             + " /su/bin/su /debug_ramdisk/su /data/adb/ksu/bin/su"
             + " /vendor/bin/su /product/bin/su; do"
@@ -2896,9 +2906,9 @@ public class TerminalActivity extends Activity {
     }
 
     private void loadFacts() {
-        final Shell s = sh;
-        if (s == null) return;
-        s.execRaw(FACTS_CMD, new Shell.Raw() {
+        final Transport t = sh;
+        if (t == null) return;
+        t.execRaw(FACTS_CMD, new Shell.Raw() {
             public void got(String o) {
                 facts.clear();
                 if (o == null) return;
@@ -2913,29 +2923,27 @@ public class TerminalActivity extends Activity {
 
     private String rootText() {
         return "root\n"
+             + "  transport  " + transportLine() + "\n"
+             + "  uid now    " + (sh == null ? "none" : String.valueOf(sh.uid())) + "\n"
              + "  manager    " + f("mgr") + "\n"
              + "  su         " + f("su") + "\n"
              + "  su works   " + f("suworks") + "\n"
-             + "  uid now    " + f("uid") + "\n"
              + "  selinux    " + f("selinux") + "\n"
              + "\n"
-             + "root is optional here. everything runs through Shizuku as\n"
-             + "uid 2000; root would only add ptrace, /proc/<pid>/mem and\n"
-             + "writes outside the shared folders.\n"
+             + "three ways to get a shell here, none of which needs the\n"
+             + "others. 'adbsetup' is the one that works on an unrooted\n"
+             + "headset with no Shizuku at all.\n"
              + "\n"
-             + "su is invoked at each of those paths in turn, not just as a\n"
-             + "bare 'su', because the binary itself is what makes the manager\n"
-             + "show its prompt. /product/bin/su is the stock location on most\n"
-             + "modern Androids and Magisk magic-mounts over it, so it is\n"
-             + "tried first. Checking only $PATH reported rooted phones as\n"
-             + "unrooted, because su is not always on the PATH at all.\n";
+             + "su is invoked at each known path in turn, by absolute path,\n"
+             + "not as a bare 'su': the binary itself is what makes the\n"
+             + "manager show its prompt, and it is not always on $PATH.\n"
+             + "/product/bin/su is the stock location on modern Android and\n"
+             + "Magisk magic-mounts over it; KernelSU uses /debug_ramdisk/su.\n";
     }
 
     /**
-     * Reads android/api straight from getprop, so this reports whatever the
-     * device is actually running rather than a value baked in for one headset.
-     * Values come from the cached table, and a refresh is kicked off after
-     * printing so a second 'info' is always current.
+     * Values come from the cached table; a refresh is kicked off after printing
+     * so a second 'info' is always current.
      */
     private String infoText(Session s) {
         String out = "device\n"
@@ -2945,42 +2953,59 @@ public class TerminalActivity extends Activity {
              + "  android      " + f("android") + " (api " + f("api") + ")\n"
              + "  build        " + f("build") + "\n"
              + "  serial       " + f("serial") + "\n"
+             + "  transport    " + transportLine() + "\n"
              + "  uid here     " + f("uid") + "\n"
              + "  cwd          " + (s.cwd.isEmpty() ? "/" : s.cwd) + "\n"
-             + "  busybox      " + f("busybox") + "\n"
+             + "  toybox       " + f("toybox") + "\n"
              + "  selinux      " + f("selinux") + "\n"
-             + "  root         " + f("su") + "\n"
+             + "  su           " + f("su") + "\n"
+             + "  adb client   " + (AdbBin.available(this) ? adbBanner() : "not in this build") + "\n"
+             + "  adb device   " + pget("adbDev", "not paired") + "\n"
              + "  wireless dbg " + f("adbport") + "\n";
         loadFacts();
         return out;
     }
 
+    /**
+     * The pairing code and port come off the headset's own wireless-debugging
+     * screen and cannot be read from here; the port adbd keeps afterwards can,
+     * and that is the one worth remembering.
+     */
     private String adbHelpText() {
-        return "wireless debugging\n"
-             + "\nThis app cannot pair for you. adb pair needs an RSA-signed\n"
-             + "handshake (ro.adb.secure=1) and there is no adb binary on the\n"
-             + "device, so the pairing step has to run from your PC:\n"
-             + "\n  1. on the Quest:  Settings > Developer > Wireless debugging\n"
-             + "  2. pair device with pairing code  -> shows a 6-digit code\n"
-             + "  3. on your PC:\n"
-             + "       adb pair 192.168.1.50:&lt;pairing-port&gt;\n"
-             + "       adb connect 192.168.1.50:5555\n"
-             + "  4. that port changes every boot, read it here:\n"
-             + "       getprop persist.adb.tcp.port\n"
-             + "\ncurrent port: " + f("adbport") + "\n";
+        StringBuilder sb = new StringBuilder();
+        sb.append("wireless debugging\n\n");
+        if (!AdbBin.available(this)) {
+            sb.append("this build carries no adb client. nothing to pair with.\n");
+            return sb.toString();
+        }
+        sb.append("adb client:  ").append(adbBanner()).append("\n");
+        sb.append("key store:   ").append(AdbBin.homeDir(this)).append("/.android/adbkey\n\n");
+        sb.append("one command does the whole flow:\n\n");
+        sb.append("  adbsetup <pairport> <code> [port]\n\n");
+        sb.append("the port and the 6-digit code are both on the headset's\n");
+        sb.append("own Settings > Developer > Wireless debugging screen,\n");
+        sb.append("under 'pair device with pairing code'. the pair port\n");
+        sb.append("changes every time you ask for a new code.\n\n");
+        sb.append("the first connect also makes the headset show its own\n");
+        sb.append("'allow debugging' prompt for this app's key. accept it on\n");
+        sb.append("the device; adbsetup waits there for a minute and a half.\n\n");
+        sb.append("adbsetup pairs, connects, pins adbd to 5555 so the port\n");
+        sb.append("stops moving every boot, and asks for root. on a retail\n");
+        sb.append("build adbd stays uid 2000 and the shell is still usable.\n\n");
+        sb.append("these keep things moving:\n\n");
+        sb.append("  adbtcpip [port]           pin adbd to a fixed port\n");
+        sb.append("  adbroot                   ask adbd to restart as root;\n");
+        sb.append("                              works on userdebug/eng builds\n");
+        sb.append("  adbdev                    show what the client sees\n");
+        sb.append("  adbuse                    go back to Shizuku\n\n");
+        sb.append("current port: ").append(f("adbport")).append("\n");
+        return sb.toString();
     }
 
     /**
-     * pkg: install prebuilt arm64 packages from the Termux repo into PREFIX.
-     *
-     *   pkg install <name>   fetch, verify, extract, with dependencies
-     *   pkg info <name>       what it would pull in, nothing downloaded
-     *   pkg list              what is installed
-     *   pkg remove <name>     delete the files it installed
-     *   pkg search <text>     find package names
-     *
-     * The scripts themselves live in Pkg. Output arrives through the normal
-     * shell reply, so progress shows as it happens rather than all at once.
+     * pkg: prebuilt arm64 packages from the Termux repo. The generated scripts
+     * live in Pkg; output arrives through the normal shell reply, so progress
+     * shows as it happens rather than all at once.
      */
     private void doPkg(String arg, final Session s) {
         if (sh == null) { append("no shell yet\n"); return; }
@@ -3008,11 +3033,9 @@ public class TerminalActivity extends Activity {
         String verb;
         int sp = a.indexOf(' ');
         if (sp < 0) {
-            // Subcommands that take no argument have to be recognised before
-            // the bare-word fallback below, or 'pkg status' has no space in it
-            // and became 'pkg install status', which then tried to download a
-            // package called "status". That quietly broke pkg list, pkg where
-            // and pkg log too, all of which are single words.
+            // Arg-less subcommands must be matched before the bare-word fallback
+            // below, or 'pkg status' becomes 'pkg install status' and tries to
+            // download a package called "status".
             String w = a.toLowerCase(Locale.US);
             if (w.equals("list") || w.equals("ls")) {
                 sh.exec(Pkg.listScript(), s.cwd);
@@ -3079,24 +3102,20 @@ public class TerminalActivity extends Activity {
             return;
         }
 
-        // Install runs in the background. Blocking on it looked broken: the
-        // transport buffers a whole command and only replies when the process
-        // exits, so the input stayed locked and the screen showed nothing for
-        // the several minutes that 17 packages take. So the generated script
-        // goes up as a file and gets started with nohup, and the user watches
-        // it with 'pkg status'.
+        // Background it: the transport buffers a whole command until the process
+        // exits, so blocking left the input locked and the screen blank for the
+        // minutes 17 packages take. The script goes up as a file and is started
+        // with nohup; the user watches it with 'pkg status'.
         append("preparing " + name + "...\n");
         s.busy = true;
         stageInstallScript(name, s);
     }
 
     /**
-     * Upload the generated install script, then launch it detached.
-     *
-     * The script has to travel as a file rather than inline. This busybox's
-     * ash writes here-documents to a temp file under /data/local, which uid
-     * 2000 cannot write to, so the obvious way of shipping a script to the
-     * device fails for a reason that has nothing to do with packages.
+     * The script travels as a file rather than inline: ash writes here-documents
+     * here-documents to a temp file under /data/local, which uid 2000 cannot
+     * write to, so shipping one to the device fails for a reason that has
+     * nothing to do with packages.
      */
     private void stageInstallScript(final String name, final Session s) {
         final String script = Pkg.installScript(name);
@@ -3133,17 +3152,10 @@ public class TerminalActivity extends Activity {
     }
 
     /**
-     * run <script>
-     *
-     * Two things were wrong here. The path went into the command line
-     * unquoted, so 'run my test.ps1' became 'sh my test.ps1' and sh tried to
-     * run a file called "my" - which is why a perfectly good script reported
-     * that it did not exist. And it always used sh, so a .ps1 was fed to the
-     * wrong interpreter even inside a live PowerShell session.
-     *
-     * Now: the path is resolved against the session directory and the usual
-     * download folders, existence is checked so the error names the file, and
-     * the interpreter is chosen by extension.
+     * run <script>: the path is resolved against the session directory and the
+     * usual download folders, existence is checked so the error names the file,
+     * and the interpreter is chosen by extension (a .ps1 used to be fed to sh,
+     * even inside a live PowerShell session).
      */
     private void doRun(String arg, Session s) {
         if (arg == null || arg.trim().isEmpty()) {
@@ -3235,16 +3247,12 @@ public class TerminalActivity extends Activity {
      * awkward.
      */
     /**
-     * Open the REAL Android settings, not the Quest one.
-     *
-     * An implicit android.settings.* intent gets hijacked by
-     * com.oculus.vrshell.intents.AndroidIntentsRelayActivity, which drops you
-     * in Meta's own VR settings shell that has no developer pages. Naming the
-     * component explicitly skips resolution entirely, so vrshell never gets a
-     * look in.
-     *
-     * Verified on device:
-     *   com.android.settings/.Settings$DevelopmentSettingsDashboardActivity
+     * Open the real Android settings, not the Quest one: an implicit
+     * android.settings.* intent is hijacked by
+     * com.oculus.vrshell.intents.AndroidIntentsRelayActivity, which drops you in
+     * Meta's VR settings shell with no developer pages. Naming the component
+     * skips resolution entirely so vrshell never gets a look in. Class verified
+     * on device: com.android.settings/.Settings$DevelopmentSettingsDashboardActivity
      */
     private void openAndroidSettings(String pkg, String cls) {
         try {
@@ -3254,10 +3262,9 @@ public class TerminalActivity extends Activity {
                     | Intent.FLAG_ACTIVITY_CLEAR_TASK);
             startActivity(i);
         } catch (Throwable t) {
-            // Do NOT fall back to the implicit intent here. On Quest that is
-            // claimed by com.oculus.vrshell.intents.AndroidIntentsRelayActivity
-            // and lands in Meta's own settings shell instead of Android's.
-            // A wrong-but-silent screen is worse than an honest message.
+            // Do NOT fall back to the implicit intent: on Quest it is claimed by
+            // vrshell and lands in Meta's settings shell instead of Android's. A
+            // wrong-but-silent screen is worse than an honest message.
             toast("Can't open " + cls.substring(cls.lastIndexOf('$') + 1)
                     + "\nAndroid Settings won't accept the request.");
         }
@@ -3289,241 +3296,6 @@ public class TerminalActivity extends Activity {
                 toast("no settings app available");
             }
         }
-    }
-
-    /**
-     * Settings: transport status, and wireless-debugging setup.
-     *
-     * On the adb point specifically - the user is right that pairing is the
-     * mechanism (a port plus a 6-digit code). What an app still cannot do is
-     * perform the pairing itself: adb pair needs an RSA-signed AUTH handshake
-     * and, on first contact, on-device approval. The app could implement that
-     * protocol, but the approval prompt has to be accepted on the headset, so it
-     * is not a silent operation either. Until that is built, this menu reports
-     * the live state and gives the exact commands to run from the PC.
-     */
-    /**
-     * Panel for the in-process adb transport: pair with a device, or connect to
-     * one that already trusts this app's key. Fields are the IP address, the
-     * port and the six-digit pairing code shown by
-     * Developer options -> Wireless debugging.
-     */
-    private void showAdbDialog() {
-        final android.app.Dialog dlg = new android.app.Dialog(this);
-        LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(18), dp(16), dp(18), dp(12));
-        box.setBackgroundColor(0xFF0A0A0A);
-
-        TextView head = new TextView(this);
-        head.setText("ADB  (in-process, no root)");
-        head.setTextColor(0xFFCCCCCC);
-        head.setTextSize(17);
-        box.addView(head);
-
-        TextView hint = new TextView(this);
-        hint.setTextSize(11);
-        hint.setTextColor(0xFF8A8A8A);
-        hint.setText("On the headset: Developer options > Wireless debugging >"
-                + " Pair device with pairing code. Enter that IP, port and code here."
-                + " Pairing port differs from the connect port.");
-        box.addView(hint);
-
-        final EditText fIp = new EditText(this);
-        fIp.setHint("IP address (e.g 192.168.1.50)");
-        fIp.setTextColor(0xFFEDEDF2);
-        fIp.setHintTextColor(0xFF707070);
-        fIp.setTextSize(13);
-        fIp.setSingleLine(true);
-        String ph = adbPrefs().getString("host", "");
-        if (ph.length() > 0) fIp.setText(ph);
-        box.addView(fIp);
-
-        final EditText fPort = new EditText(this);
-        fPort.setHint("port - tap, then use the pad");
-        fPort.setTextColor(0xFFEDEDF2);
-        fPort.setHintTextColor(0xFF707070);
-        fPort.setTextSize(13);
-        fPort.setSingleLine(true);
-        int pp = adbPrefs().getInt("port", 0);
-        if (pp > 0) fPort.setText(String.valueOf(pp));
-        box.addView(fPort);
-
-        final EditText fCode = new EditText(this);
-        fCode.setHint("pairing code - 6 digits");
-        fCode.setTextColor(0xFFEDEDF2);
-        fCode.setHintTextColor(0xFF707070);
-        fCode.setTextSize(13);
-        fCode.setSingleLine(true);
-        box.addView(fCode);
-
-        // port and code are both pure digits, so give them buttons
-        box.addView(numPad(new String[] { "PORT", "CODE" },
-                new EditText[] { fPort, fCode }, new int[] { 5, 6 }));
-
-        LinearLayout row1 = new LinearLayout(this);
-        row1.setOrientation(LinearLayout.HORIZONTAL);
-        final TextView out = new TextView(this);
-        out.setTypeface(android.graphics.Typeface.MONOSPACE);
-        out.setTextSize(10);
-        out.setTextColor(0xFF9CDCFE);
-        out.setText("idle");
-
-        TextView bPair = mkBtn("PAIR");
-        TextView bConn = mkBtn("CONNECT");
-        TextView bRun  = mkBtn("RUN 'id'");
-        row1.addView(bPair, new LinearLayout.LayoutParams(0, dp(40), 1f));
-        row1.addView(bConn, new LinearLayout.LayoutParams(0, dp(40), 1f));
-        row1.addView(bRun,  new LinearLayout.LayoutParams(0, dp(40), 1f));
-        box.addView(row1);
-
-        // Self: talk to this device's own adbd over loopback. No IP to type and
-        // no pairing, because the port is persisted and our key is already known.
-        final TextView bSelf = mkBtn("SELF  127.0.0.1:" + adbDevicePort());
-        box.addView(bSelf, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(40)));
-
-        ScrollView sc = new ScrollView(this);
-        sc.addView(out);
-        box.addView(sc, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
-
-        TextView close = mkBtn("CLOSE");
-        close.setTextColor(0xFFCCCCCC);
-        close.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) { dlg.dismiss(); }
-        });
-        box.addView(close, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(40)));
-
-        final AdbKey[] holder = new AdbKey[1];
-        bPair.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) { adbGo(holder, out, fIp, fPort, fCode, 0); }
-        });
-        bConn.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) { adbGo(holder, out, fIp, fPort, fCode, 1); }
-        });
-        bRun.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) { adbRun(holder, out, fIp, fPort); }
-
-        });
-        bSelf.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) {
-                fIp.setText("127.0.0.1");
-                fPort.setText(String.valueOf(adbDevicePort()));
-                adbGo(holder, out, fIp, fPort, fCode, 1);
-            }
-        });
-
-        dlg.setContentView(box);
-        dlg.setOnShowListener(new android.content.DialogInterface.OnShowListener() {
-            public void onShow(android.content.DialogInterface di) {
-                dlg.getWindow().setLayout(dp(760), dp(560));
-                dlg.getWindow().setBackgroundDrawable(
-                        new android.graphics.drawable.ColorDrawable(0xFF0A0A0A));
-            }
-        });
-        dlg.show();
-
-        // resolve the key in the background so the buttons are never blocked
-        new Thread(new Runnable() {
-            public void run() {
-                try {
-                    AdbKey existing = loadAdbKey();
-                    if (existing != null) {
-                        holder[0] = existing;
-                        return;
-                    }
-                    java.io.File f = new java.io.File(getFilesDir(), "adbkey");
-                    AdbKey k = AdbKey.generate();
-                    String pem = "-----BEGIN PRIVATE KEY-----\n"
-                            + java.util.Base64.getMimeEncoder(64, "\n".getBytes())
-                                .encodeToString(k.priv.getEncoded())
-                            + "\n-----END PRIVATE KEY-----\n";
-                    java.io.FileWriter w = new java.io.FileWriter(f);
-                    w.write(pem); w.close();
-                    holder[0] = k;
-                } catch (Throwable t) {
-                    post(new Runnable() { public void run() {
-                        out.setText("key error: " + t); } });
-                }
-            }
-        }).start();
-    }
-
-    private void adbGo(final AdbKey[] holder, final TextView out,
-                       final EditText ip, final EditText port, final EditText code,
-                       final int mode) {
-        final String h = ip.getText().toString().trim();
-        final String p = port.getText().toString().trim();
-        final String c = code.getText().toString().trim();
-        if (holder[0] == null) { out.setText("key still generating..."); return; }
-        if (h.isEmpty() || p.isEmpty()) { out.setText("need IP and port"); return; }
-        out.setText(mode == 0 ? "pairing..." : "connecting...");
-        final AdbKey k = holder[0];
-        new Thread(new Runnable() {
-            public void run() {
-                String res;
-                AdbLink link = new AdbLink(k);
-                try {
-                    boolean ok = (mode == 0)
-                        ? link.pair(h, Integer.parseInt(p), c)
-                        : link.connect(h, Integer.parseInt(p));
-                    res = (ok ? "OK\n" : "FAILED\n") + link.lastLog();
-                    if (ok) {
-                        // Remember it so the command line can use this transport.
-                        post(new Runnable() {
-                            public void run() {
-                                adbKey = k;
-                                adbHost = h;
-                                adbPort = Integer.parseInt(p);
-                                adbPrefs().edit()
-                                    .putString("host", h)
-                                    .putInt("port", Integer.parseInt(p))
-                                    .apply();
-                                if (sh == null) {
-                                    status.setText("shizuku: down | using adb transport");
-                                }
-                            }
-                        });
-                    }
-                } catch (Throwable t) {
-                    res = "error: " + t + "\n" + link.lastLog();
-                } finally {
-                    link.close();
-                }
-                final String fin = res;
-                post(new Runnable() { public void run() { out.setText(fin); } });
-            }
-        }).start();
-    }
-
-    private void adbRun(final AdbKey[] holder, final TextView out,
-                        final EditText ip, final EditText port) {
-        final String h = ip.getText().toString().trim();
-        final String p = port.getText().toString().trim();
-        if (holder[0] == null) { out.setText("key still generating..."); return; }
-        out.setText("connecting + running id...");
-        final AdbKey k = holder[0];
-        new Thread(new Runnable() {
-            public void run() {
-                String res;
-                AdbLink link = new AdbLink(k);
-                try {
-                    if (!link.connect(h, Integer.parseInt(p))) {
-                        res = "connect failed\n" + link.lastLog();
-                    } else {
-                        res = link.exec("id", 8000) + "\n" + link.lastLog();
-                    }
-                } catch (Throwable t) {
-                    res = "error: " + t + "\n" + link.lastLog();
-                } finally {
-                    link.close();
-                }
-                final String fin = res;
-                post(new Runnable() { public void run() { out.setText(fin); } });
-            }
-        }).start();
     }
 
     private void post(final Runnable r) {
@@ -3579,13 +3351,10 @@ public class TerminalActivity extends Activity {
         LinearLayout links = new LinearLayout(this);
         links.setOrientation(LinearLayout.HORIZONTAL);
         links.setPadding(0, dp(6), 0, 0);
-        // Components verified with `cmd package resolve-activity --brief -n ...`
-        // on this device. Naming them explicitly is required: an implicit
-        // android.settings.* intent is hijacked by
-        // com.oculus.vrshell.intents.AndroidIntentsRelayActivity and lands in
-        // Meta's own settings shell, which has no developer pages at all.
-        // There is no wireless-debugging settings activity on Quest, only a
-        // QS tile behind BIND_QUICK_SETTINGS_TILE, so that one is not linked.
+        // Verified with `cmd package resolve-activity --brief -n ...` on device.
+        // Naming components is required: implicit android.settings.* intents are
+        // hijacked by vrshell. There is no wireless-debugging settings activity
+        // on Quest, only a QS tile, so that one is not linked.
         final String[][] nav = {
             {"DEV OPTIONS", "com.android.settings/.Settings$DevelopmentSettingsDashboardActivity"},
             {"APPS",        "com.android.settings/.Settings$ManageApplicationsActivity"},
@@ -3616,7 +3385,7 @@ public class TerminalActivity extends Activity {
         if (sh == null) {
             body.setText("transport   shizuku NOT connected\n\n"
                     + "grant this app in Shizuku/ByteZuku, then reopen.\n"
-                    + "see adb pairing notes below for a fallback path.\n");
+                    + "no Shizuku at all? 'adbsetup' gets a shell anyway.\n");
             return;
         }
 
@@ -3631,14 +3400,14 @@ public class TerminalActivity extends Activity {
         };
         final StringBuilder sb = new StringBuilder();
         sb.append("WIRELESS DEBUGGING\n\n");
-        sb.append("adb pair needs a port plus a 6-digit code, and the\n");
-        sb.append("app cannot complete the RSA handshake silently - the\n");
-        sb.append("device must approve it. Run from your PC:\n\n");
+        sb.append("adbsetup <pairport> <code> pairs this app's own adb\n");
+        sb.append("client, so everything runs on the headset, not a PC.\n");
+        sb.append("both numbers come from the headset's own screen:\n\n");
         sb.append("  1. Quest: Settings > Developer > Wireless debugging\n");
         sb.append("     > Pair device with pairing code\n");
-        sb.append("  2. PC:  adb pair 192.168.1.50:<pair-port> <code>\n");
-        sb.append("     adb connect 192.168.1.50:5555\n\n");
-        sb.append("the port changes every boot, it is below.\n\n");
+        sb.append("  2. type:  adbsetup <pair-port> <code>\n\n");
+        sb.append("the pair port changes every time you ask for a new\n");
+        sb.append("code. adbdev shows the live state.\n\n");
         sb.append("live state\n");
         final TextView out = body;
         fill(keys, 0, sb, out);
@@ -3701,9 +3470,7 @@ public class TerminalActivity extends Activity {
             "uid",       "id -u",
             "selinux",   "getenforce",
             "root",      "[ -e /product/bin/su ] && echo present || echo absent",
-            "busybox",   "/data/local/tmp/busybox | head -1",
             "adb port",  "getprop persist.adb.tcp.port",
-            "prefix",    "ls -d /data/local/tmp/bbterm 2>/dev/null || echo none",
         };
         fill(keys, 0, sb, body);
     }
@@ -3735,10 +3502,25 @@ public class TerminalActivity extends Activity {
     private String helpText() {
         Session s = sessions.isEmpty() ? null : sessions.get(current);
         int uid = s == null ? 2000 : s.uid;
-        return headset() + " - uid 2000 shell through Shizuku/ByteZuku, no root\n"
+        return headset() + " - " + transportLine() + "\n"
              + "drive map   C: device root (\\" + host() + "\\)   D: /storage/emulated/0   E: tool prefix\n"
              + "privilege   $ = uid " + uid + " shell   # = uid 0 root\n"
              + "prompt      " + prompt() + "        ('prompt' cycles cmd / plain / unix)\n\n"
+             + "getting a shell - any one of these is enough, none needs the others\n"
+             + "  adbsetup <pairport> <code> [port]\n"
+             + "                    the only adb command you need. pairs this app's\n"
+             + "                    own adb client to this device and runs on it, so\n"
+             + "                    it works on an unrooted headset with no Shizuku:\n"
+             + "                    pair, connect, pin the port, ask for root.\n"
+             + "                    both numbers are on the headset's own\n"
+             + "                    Settings > Developer > Wireless debugging screen.\n"
+             + "  adbtcpip [port]           pin adbd to a fixed port (5555)\n"
+             + "  adbroot                   ask adbd to restart as root (userdebug)\n"
+             + "  adbdev                    what the bundled client can see\n"
+             + "  adbuse                    go back to Shizuku\n"
+             + "  su [command]              root via the app's own su\n"
+             + "  askforsu                  same, but waits 60s for the prompt\n"
+             + "  checkshizuku              did shizuku say yes or no\n\n"
              + "navigation\n"
              + "  cdroot            go to /                    -> " + winPath("/") + "\n"
              + "  cdshell           go to /storage/emulated/0   -> " + winPath("/storage/emulated/0") + "\n"
@@ -3757,10 +3539,6 @@ public class TerminalActivity extends Activity {
              + "  color             list the colors, or: color <name> <RRGGBB>\n"
              + "                    names: bg ps fg prompt dim theme\n"
              + "  rootcheck         root status: manager, su, whether it works\n"
-             + "  askforsu          ask the root manager for root and wait 30s.\n"
-             + "                    approve it in Magisk/KernelSU/APatch when the\n"
-             + "                    prompt appears. says granted, refused, or\n"
-             + "                    no root, and names the manager it found.\n"
              + "  adbd              adb daemon state on this device\n"
              + "  settings          open a Quest settings page (adbhelp lists targets)\n"
              + "  pkg install <p>   prebuilt Termux arm64 packages, with dependencies\n"
@@ -3788,13 +3566,11 @@ public class TerminalActivity extends Activity {
              + "    target here is named by component, not by action string.\n"
              + "  screencap returns a black frame, so verify UI through logcat:\n"
              + "    logcat -s BBterm, AndroidRuntime, System.err\n"
-             + "  adb cannot authorise itself. The PC's key is paired over the WIFI\n"
-             + "    TLS transport only, and adbd tracks authorisation per transport,\n"
-             + "    so a plain TCP 5555 connection from inside an app gets a\n"
-             + "    confirmation prompt it can never satisfy. /data/misc/adb/adb_keys\n"
-             + "    is root-only, and TLS/SPAKE2 pairing is not reimplemented here.\n"
-             + "    That is why the shell comes from Shizuku instead: it is already\n"
-             + "    uid 2000 and needs no key at all.\n"
+             + "  adb has to be paired before it is trusted, and /data/misc/adb/\n"
+             + "    adb_keys is root-only, so a PC's key is paired over the WIFI\n"
+             + "    TLS transport only. adbsetup does that pairing for this app's\n"
+             + "    own bundled client, which is why the commands run on the\n"
+             + "    headset instead of on a PC.\n"
              + "  SELinux is Enforcing, so uid 2000 has CapEff 0 and cannot ptrace\n"
              + "    another process or read /proc/<pid>/mem. Anything that needs to\n"
              + "    inject into a running process wants root.\n"
@@ -3809,9 +3585,8 @@ public class TerminalActivity extends Activity {
              + "  pwsh <expr>       one-shot, no session. good for a quick check:\n"
              + "                    pwsh 6*7\n"
              + "                    pwsh $PSVersionTable.PSVersion\n\n"
-             + "  busybox applets resolve automatically (awk, sed, grep, tar,\n"
-             + "  find, xxd, wget, hexdump, stat, du, df ...)\n"
-             + "  there is no curl applet in this busybox, use wget\n\n"
+             + "  applets (awk, sed, grep, tar, wget, hexdump ...) come from\n"
+             + "  the device's own toybox in /system/bin, as typed\n\n"
              + "handy on Quest\n"
              + "  dumpsys battery   power state, headset runtime\n"
              + "  dumpsys thermalservice   thermal zones and throttling\n"

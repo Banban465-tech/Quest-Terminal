@@ -226,6 +226,49 @@ final class AdbBin {
 
     private static volatile String announced = "";
 
+    /**
+     * Where the key lives and whether it is actually there.
+     *
+     * getDir(MODE_PRIVATE) is app-private storage, so it survives an app restart
+     * and a headset reboot. Only an uninstall or a 'clear data' wipes it, and
+     * both of those mean a new key, which means pairing again. Worth being able
+     * to see rather than take on faith, so termdev keys reports the path and
+     * lists it.
+     */
+    static String keyReport() {
+        StringBuilder sb = new StringBuilder();
+        java.io.File home = new java.io.File(homeDirOf(lastCtx));
+        sb.append("HOME:  ").append(home.getAbsolutePath()).append('\n');
+        sb.append("exists: ").append(home.isDirectory() ? "yes" : "NO").append('\n');
+        if (!home.isDirectory()) {
+            sb.append("\nnothing has run adb yet, so no key has been generated.\n");
+            return sb.toString();
+        }
+        java.io.File dot = new java.io.File(home, ".android");
+        sb.append("keys:  ").append(dot.getAbsolutePath()).append('\n');
+        java.io.File[] files = dot.listFiles();
+        if (files == null || files.length == 0) {
+            sb.append("  (empty)\n");
+        } else {
+            for (java.io.File f : files) {
+                sb.append("  ").append(f.getName())
+                  .append("  ").append(f.length()).append(" bytes")
+                  .append(f.canRead() ? "" : "  (unreadable)")
+                  .append('\n');
+            }
+        }
+        return sb.toString();
+    }
+
+    private static Context lastCtx;
+
+    static void noteContext(Context ctx) { lastCtx = ctx; }
+
+    private static String homeDirOf(Context ctx) {
+        if (ctx == null) return "/data/local/tmp";
+        return homeDir(ctx);
+    }
+
     static Result exec(List<String> cmd, String home, String user, String hostname, int timeoutMs) {
         Result r = new Result();
         Process p = null;

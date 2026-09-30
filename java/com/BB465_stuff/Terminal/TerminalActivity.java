@@ -2546,9 +2546,18 @@ adbT = new AdbShell(this, device, shCb);
             append("termdev info            build, device, transport\n"
                     + "termdev log [n]         last n lines from logcat (default 200)\n"
                     + "termdev savelog <dir>   write those lines to <dir>/bbterm.log\n"
-                    + "termdev server          which adb server answers, and whose\n"
++ "termdev server          which adb server answers, and whose\n"
+                    + "termdev keys             where the adb key is kept, and if it is there\n"
                     + "termdev adb <args...>    run the bundled adb directly\n"
                     + "termdev selftest        what is reachable from in here\n\n");
+            return;
+        }
+
+        if (sub.equals("keys")) {
+            append(AdbBin.keyReport());
+            append("\nthis is app-private storage, so it survives a restart and a\n"
+                    + "reboot. only an uninstall or 'clear data' throws it away, and\n"
+                    + "that means a new key, which means pairing again.\n\n");
             return;
         }
 
@@ -2842,6 +2851,7 @@ adbT = new AdbShell(this, device, shCb);
                     adbPrefs().edit().putString("codename", codename).apply();
                     // the adb pairing name is built from this, so it has to be
                     // set here rather than read separately per call
+                    AdbBin.noteContext(TerminalActivity.this);
                     AdbBin.codename = codename;
                     // and the server has to be restarted to use it. adb is a
                     // client to a long-lived server, and it is the server that

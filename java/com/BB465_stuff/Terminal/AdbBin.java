@@ -27,6 +27,21 @@ final class AdbBin {
     private static final int DEFAULT_TIMEOUT_MS = 20000;
     private static final int LONG_TIMEOUT_MS = 120000;
 
+    /**
+     * Its own adb server, off the default 5037.
+     *
+     * adb connects to whatever already listens on the server port, so on a
+     * device running another adb-using app this process inherits *that* app's
+     * server and its transports. Observed on a Quest 3: the only server on 5037
+     * belonged to another package, so 'adb kill-server' killed that app's server
+     * instead of resetting this one, and 'already connected' kept answering
+     * from a transport made before the key was authorised.
+     *
+     * -P on every call keeps the two apart, which makes kill-server mean
+     * something. Costs one extra server process while the app is open.
+     */
+    static final int SERVER_PORT = 5038;
+
     private final String bin;
     private final String home;
     private final String device;
@@ -82,7 +97,10 @@ final class AdbBin {
         String p = binaryPath(ctx);
         if (p == null) return cachedVersion = "absent";
         List<String> cmd = new ArrayList<String>();
-        cmd.add(p); cmd.add("version");
+        cmd.add(p);
+        cmd.add("-P");
+        cmd.add(String.valueOf(SERVER_PORT));
+        cmd.add("version");
         Result r = exec(cmd, homeDir(ctx), DEFAULT_TIMEOUT_MS);
         String out = r.out;
         if (out.length() == 0) out = "not runnable: " + firstLine(r.err);
@@ -172,11 +190,13 @@ final class AdbBin {
     }
 
     /** blocking adb invocation, output and diagnostics together */
-    public String run(String... args) {
-        if (bin == null) return "adb: not in this build";
-        List<String> cmd = new ArrayList<String>();
-        cmd.add(bin);
-        for (String a : args) cmd.add(a);
+public String run(String... args) {
+          if (bin == null) return "adb: not in this build";
+          List<String> cmd = new ArrayList<String>();
+          cmd.add(bin);
+          cmd.add("-P");
+          cmd.add(String.valueOf(SERVER_PORT));
+          for (String a : args) cmd.add(a);
         Result r = exec(cmd, home, isSlow(args) ? LONG_TIMEOUT_MS : DEFAULT_TIMEOUT_MS);
         StringBuilder sb = new StringBuilder(r.out);
         if (r.err.length() > 0) {
@@ -201,11 +221,13 @@ final class AdbBin {
                 || "reconnect".equals(verb) || "connect".equals(verb);
     }
 
-    private Result raw(int timeoutMs, String... args) {
-        if (bin == null) { Result r = new Result(); r.err = "adb: not in this build"; return r; }
-        List<String> cmd = new ArrayList<String>();
-        cmd.add(bin);
-        for (String a : args) cmd.add(a);
+private Result raw(int timeoutMs, String... args) {
+          if (bin == null) { Result r = new Result(); r.err = "adb: not in this build"; return r; }
+          List<String> cmd = new ArrayList<String>();
+          cmd.add(bin);
+          cmd.add("-P");
+          cmd.add(String.valueOf(SERVER_PORT));
+          for (String a : args) cmd.add(a);
         return exec(cmd, home, timeoutMs);
     }
 

@@ -1571,6 +1571,7 @@ String cwd = "";
             || verb.equals("adbtcpip") || verb.equals("adbwireless")
             || verb.equals("adbroot") || verb.equals("adbdev")
             || verb.equals("adbkillserver") || verb.equals("adbstartserver")
+            || verb.equals("termdev")
             || verb.equals("adbhint") || verb.equals("adbh")
             || verb.equals("adbuse") || verb.equals("adbshizuku")
             || verb.equals("info") || verb.equals("rootcheck") || verb.equals("commands")
@@ -2520,6 +2521,132 @@ String cwd = "";
     }
 
     /**
+     * termdev: diagnostics for a terminal, nothing else.
+     *
+     * termdev                 list these
+     * termdev info            what the build is and what it found on this device
+     * termdev log [n]         the last n lines this app wrote to logcat
+     * termdev savelog <dir>   dump that log to <dir>/bbterm.log, then print it
+     * termdev server          which adb server is answering, and whose
+     * termdev selftest        report what is and is not reachable from here
+     */
+    private void doTermDev(String arg, final Session s) {
+        String[] a = arg == null ? new String[0] : arg.trim().split("\\s+");
+        String sub = a.length == 0 ? "" : a[0].toLowerCase(java.util.Locale.US);
+
+        if (sub.length() == 0 || sub.equals("help")) {
+            append("termdev info            build, device, transport\n"
+                    + "termdev log [n]         last n lines from logcat (default 200)\n"
+                    + "termdev savelog <dir>   write those lines to <dir>/bbterm.log\n"
+                    + "termdev server          which adb server answers, and whose\n"
+                    + "termdev selftest        what is reachable from in here\n\n");
+            return;
+        }
+
+        if (sub.equals("info")) {
+            append("build:     " + myVersion() + " (code 3)\n"
+                    + "device:    " + headset() + "\n"
+                    + "transport: " + transportLine() + "\n"
+                    + "adb client:" + (AdbBin.available(this) ? " " : " not in this build, ")
+                    + AdbBin.versionCached().replace('\n', ' ') + "\n"
+                    + "adb server: port " + AdbBin.SERVER_PORT + " (its own)\n"
+                    + "su:        " + describeSuOnDisk() + "\n"
+                    + "prefix:    " + ShellService.PREFIX + "\n"
+                    + "packages:  " + ShellService.PKGROOT + "\n\n");
+            return;
+        }
+
+        if (sub.equals("log") || sub.equals("savelog")) {
+            int n = 200;
+            String dir = null;
+            for (int i = 1; i < a.length; i++) {
+                try { n = Integer.parseInt(a[i]); } catch (NumberFormatException e) { dir = a[i]; }
+            }
+            final int lines = Math.max(1, Math.min(2000, n));
+            final String where = sub.equals("savelog") ? (dir == null ? ShellService.PKGROOT : dir) : null;
+            final int keep = lines;
+            devJobs.add(new java.util.concurrent.Callable<String>() {
+                public String call() { return fetchLog(keep, where); }
+            });
+            adbJob(s, devJobs.remove(devJobs.size() - 1));
+            return;
+        }
+
+        if (sub.equals("server")) {
+            append("this app talks to adb server port " + AdbBin.SERVER_PORT + ".\n"
+                    + "adb normally reuses whatever already listens on 5037, which on\n"
+                    + "this device was another app's server, so 'adb kill-server' would\n"
+                    + "have killed that app instead of resetting this one.\n\n");
+            sh.exec("ss -tln | grep -E '5037|" + AdbBin.SERVER_PORT + "'");
+            return;
+        }
+
+        if (sub.equals("selftest")) {
+            append("checking what is reachable from in here:\n\n");
+            String[] probe = {
+                    "echo ok",
+                    "id -u",
+                    "ls -d " + ShellService.PKGROOT,
+                    "ls -d " + ShellService.PREFIX,
+                    "getprop ro.product.device",
+                    "settings get global device_name",
+                    "command -v toybox",
+                    "command -v busybox",
+                    "command -v pwsh",
+            };
+            for (String c : probe) {
+                sh.execRaw(c, new Shell.Raw() {
+                    public void got(String o) {
+                        String v = o == null ? "" : o.trim();
+                        append(v.length() > 0 ? "  ok    " + firstLineOf(v) : "  FAIL");
+                    }
+                });
+            }
+            return;
+        }
+
+        append("termdev: no such thing: " + sub + "\ntermdev for the list.\n");
+    }
+
+    private static String firstLineOf(String s) {
+        for (String l : s.split("\n")) if (l.trim().length() > 0) return l.trim();
+        return "";
+    }
+
+    private final java.util.List<java.util.concurrent.Callable<String>> devJobs =
+            new java.util.ArrayList<java.util.concurrent.Callable<String>>();
+
+    /** pull our own logcat lines, optionally writing them to a file first */
+    private String fetchLog(int n, String dir) {
+        StringBuilder out = new StringBuilder();
+        try {
+            ProcessBuilder pb = new ProcessBuilder("logcat", "-d", "-t", String.valueOf(n), "-s", "BBterm:*");
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+            java.io.BufferedReader br = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(p.getInputStream(), "UTF-8"));
+            String l;
+            while ((l = br.readLine()) != null) out.append(l).append('\n');
+            br.close();
+            p.waitFor();
+        } catch (Throwable t) {
+            return "logcat failed: " + t + "\n";
+        }
+        String body = out.toString();
+        if (body.trim().length() == 0) body = "(nothing logged under the BBterm tag)\n";
+        if (dir == null) return body;
+        String path = dir.endsWith("/") ? dir + "bbterm.log" : dir + "/bbterm.log";
+        StringBuilder sb = new StringBuilder();
+        sb.append("$ cat > ").append(path).append(" << 'BBEOF'\n").append(body).append("BBEOF\n");
+        sb.append("$ wc -l ").append(path).append('\n');
+        sh.execRaw("cat > " + Su.q(path) + " << 'BBEOF'\n" + body + "BBEOF\n"
+                + "wc -l " + Su.q(path), new Shell.Raw() {
+            public void got(String o) { }
+        });
+        return sb.toString();
+    }
+
+    /**
      * adbkillserver / adbstartserver. The bundled adb keeps its own server on
      * port 5037, and a server that already has a stale transport to the headset
      * keeps answering "already connected" no matter what state that device is
@@ -2876,6 +3003,7 @@ String cwd = "";
         if (verb.equals("adbsetup")) { doAdbSetup(arg, s); return true; }
         if (verb.equals("adbtcpip") || verb.equals("adbwireless")) { doAdbTcpip(arg, s); return true; }
         if (verb.equals("adbroot")) { doAdbRoot(s); return true; }
+        if (verb.equals("termdev")) { doTermDev(arg, s); return true; }
         if (verb.equals("adbkillserver")) { doAdbServer(s, true); return true; }
         if (verb.equals("adbstartserver")) { doAdbServer(s, false); return true; }
         if (verb.equals("adbdev")) { doAdbDev(s); return true; }
@@ -3355,6 +3483,7 @@ String cwd = "";
         sb.append("  adbdev                    show what the client sees\n");
         sb.append("  adbstartserver            restart the bundled adb, reconnect, report uid\n");
         sb.append("  adbkillserver             kill that adb first, then start it again\n");
+sb.append("  termdev                  info | log | savelog | server | selftest\n");
         sb.append("  adbuse                    go back to Shizuku\n\n");
         sb.append("current port: ").append(f("adbport")).append("\n");
         return sb.toString();
@@ -3877,7 +4006,8 @@ String cwd = "";
              + "  adbdev                    what the bundled client can see\n"
               + "  adbstartserver            restart the bundled adb, reconnect, report uid\n"
               + "  adbkillserver             kill that adb first, then start it again\n"
-             + "  adbuse                    go back to Shizuku\n"
++ "  termdev                  info | log | savelog | server | selftest\n"
+              + "  adbuse                    go back to Shizuku\n"
              + "  su [command]              root via the app's own su\n"
              + "  askforsu                  same, but waits 60s for the prompt\n"
              + "  checkshizuku              did shizuku say yes or no\n\n"

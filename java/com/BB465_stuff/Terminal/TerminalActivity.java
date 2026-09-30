@@ -2366,9 +2366,6 @@ String cwd = "";
      * is a TLS socket that closes when pairing ends, and a client pointed at it
      * reports the connect port as offline forever.
      */
-    /** what the wireless debugging screen calls this headset */
-    private static final String NAME = "Terminal";
-
     private void doAdbSetup(String arg, final Session s) {
         final String[] a = arg == null ? new String[0] : arg.trim().split("\\s+");
         if (a.length < 2) { append(adbHelpText()); return; }
@@ -2419,21 +2416,6 @@ String cwd = "";
                 final String dev = loopback(5555);
                 sb.append("\nusing ").append(dev).append('\n');
 
-                // What Settings -> Developer options -> Wireless debugging calls
-                // this headset, so the pairing screen reads "Terminal" instead of
-                // the stock model name. Only device_name, never bluetooth_name:
-                // that one is the headset's identity over Bluetooth and has no
-                // business changing here.
-                String named = pinned.shell(
-                        "settings put global device_name " + Su.q(NAME) + " && "
-                      + "settings get global device_name");
-                if (named.length() > 0) {
-                    sb.append("\ndevice name is now ").append(named)
-                      .append("  (the wireless debugging screen shows this)\n");
-                } else {
-                    sb.append("\ncould not set the device name; settings will "
-                            + "still show the stock one\n");
-}
                 String rootOut = pinned.adbRoot();
                 if (rootOut.length() > 0) sb.append(rootOut);
                 pinned.connect(dev);

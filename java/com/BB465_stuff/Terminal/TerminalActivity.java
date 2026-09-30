@@ -2390,6 +2390,19 @@ String cwd = "";
                 AdbBin b = adbBin(loopback(dp));
                 sb.append("\n$ adb connect ").append(loopback(dp)).append('\n');
                 sb.append(b.connect(loopback(dp)));
+
+                // Remember the pairing the moment it succeeds. The key is now in
+                // adb_keys on the headset; whether or not the 'allow debugging?'
+                // tap has been accepted, this device is the one to talk to next
+                // time. Saving it after the auth wait instead meant a failed
+                // authorisation threw the pairing away, so every launch started
+                // over as though nothing had ever been paired.
+                final String paired = loopback(dp);
+                post(new Runnable() {
+                    public void run() { pput("adbDev", paired); }
+                });
+                sb.append("\nsaved this device, so later commands know where to look.\n");
+
                 // First contact with this key makes the headset raise its own
                 // 'allow debugging' panel, and the user is wearing the thing:
                 // wait for the tap instead of racing it.

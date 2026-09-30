@@ -1570,6 +1570,7 @@ String cwd = "";
             || verb.equals("adbsetup")
             || verb.equals("adbtcpip") || verb.equals("adbwireless")
             || verb.equals("adbroot") || verb.equals("adbdev")
+            || verb.equals("adbkillserver") || verb.equals("adbstartserver")
             || verb.equals("adbhint") || verb.equals("adbh")
             || verb.equals("adbuse") || verb.equals("adbshizuku")
             || verb.equals("info") || verb.equals("rootcheck") || verb.equals("commands")
@@ -2518,6 +2519,54 @@ String cwd = "";
         });
     }
 
+    /**
+     * adbkillserver / adbstartserver. The bundled adb keeps its own server on
+     * port 5037, and a server that already has a stale transport to the headset
+     * keeps answering "already connected" no matter what state that device is
+     * really in. Killing it forces a fresh handshake, which is the difference
+     * between "unauthorized forever" and picking up an accepted key.
+     *
+     * adbkillserver drops the app's own adb, nothing else. This PC's adb is a
+     * separate process on a separate machine.
+     */
+    private void doAdbServer(final Session s, final boolean kill) {
+        final String dev = pget("adbDev", loopback(adbDevicePort()));
+        adbJob(s, new java.util.concurrent.Callable<String>() {
+            public String call() {
+                AdbBin b = adbBin(dev);
+                if (!AdbBin.available(TerminalActivity.this)) {
+                    return "no adb client in this build.\n";
+                }
+                StringBuilder sb = new StringBuilder();
+                if (kill) {
+                    sb.append("$ adb kill-server\n");
+                    sb.append(b.run("kill-server")).append('\n');
+                }
+                sb.append("$ adb start-server\n");
+                sb.append(b.run("start-server")).append('\n');
+                if (!kill) {
+                    sb.append("\n$ adb connect ").append(dev).append('\n');
+                    sb.append(b.connect(dev)).append('\n');
+                }
+                sb.append("\n$ adb devices\n");
+                sb.append(b.devices()).append('\n');
+                String who = AdbBin.firstLine(b.shell("whoami"));
+                if (who.length() > 0) {
+                    sb.append("shell uid: ").append(who).append('\n');
+                    sb.append("transport is up.\n");
+                    post(new Runnable() {
+                        public void run() { adoptAdb(dev); render(); }
+                    });
+                } else {
+                    sb.append("\nstill unauthorized. the headset has to accept the key:\n"
+                            + "  look for 'Allow USB debugging?' on the device and tap it.\n"
+                            + "  adbd restarts once accepted, so run adbstartserver again.\n");
+                }
+                return sb.toString();
+            }
+        });
+    }
+
     private void doAdbRoot(final Session s) {
         final String dev = pget("adbDev", loopback(adbDevicePort()));
         adbJob(s, new java.util.concurrent.Callable<String>() {
@@ -2827,6 +2876,8 @@ String cwd = "";
         if (verb.equals("adbsetup")) { doAdbSetup(arg, s); return true; }
         if (verb.equals("adbtcpip") || verb.equals("adbwireless")) { doAdbTcpip(arg, s); return true; }
         if (verb.equals("adbroot")) { doAdbRoot(s); return true; }
+        if (verb.equals("adbkillserver")) { doAdbServer(s, true); return true; }
+        if (verb.equals("adbstartserver")) { doAdbServer(s, false); return true; }
         if (verb.equals("adbdev")) { doAdbDev(s); return true; }
         if (verb.equals("adbhint") || verb.equals("adbh")) { append(adbHelpText()); return true; }
         if (verb.equals("adbuse") || verb.equals("adbshizuku")) { doAdbUse(arg, s); return true; }
@@ -3302,6 +3353,8 @@ String cwd = "";
         sb.append("  adbroot                   ask adbd to restart as root;\n");
         sb.append("                              works on userdebug/eng builds\n");
         sb.append("  adbdev                    show what the client sees\n");
+        sb.append("  adbstartserver            restart the bundled adb, reconnect, report uid\n");
+        sb.append("  adbkillserver             kill that adb first, then start it again\n");
         sb.append("  adbuse                    go back to Shizuku\n\n");
         sb.append("current port: ").append(f("adbport")).append("\n");
         return sb.toString();
@@ -3822,6 +3875,8 @@ String cwd = "";
              + "  adbtcpip [port]           pin adbd to a fixed port (5555)\n"
              + "  adbroot                   ask adbd to restart as root (userdebug)\n"
              + "  adbdev                    what the bundled client can see\n"
+              + "  adbstartserver            restart the bundled adb, reconnect, report uid\n"
+              + "  adbkillserver             kill that adb first, then start it again\n"
              + "  adbuse                    go back to Shizuku\n"
              + "  su [command]              root via the app's own su\n"
              + "  askforsu                  same, but waits 60s for the prompt\n"

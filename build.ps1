@@ -136,21 +136,24 @@ if ($natives.Count -eq 0) {
     Write-Warning "  no .so in libs\arm64-v8a - adbsetup will report 'not in this build'"
 } else {
     Step "add native libs"
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    $zip = [System.IO.Compression.ZipFile]::Open("$BUILD\unsigned.apk", 'Update')
+    # jar, not System.IO.Compression. ZipArchive's Update mode rewrites every
+    # entry and leaves an archive ART rejects with "Failed to extract
+    # 'classes.dex': Inconsistent information", which kills the app before any
+    # of its own code runs. jar keeps the entries it does not touch intact.
+    $stage = "$BUILD\stage"
+    if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $stage | Out-Null
+    Push-Location $stage
     try {
         foreach ($n in $natives) {
-            $entryName = "lib/arm64-v8a/$($n.Name)"
-            $old = $zip.GetEntry($entryName)
-            if ($old) { $old.Delete() }
-            $entry = $zip.CreateEntry($entryName, [System.IO.Compression.CompressionLevel]::Optimal)
-            $es = $entry.Open()
-            $fs = [System.IO.File]::OpenRead($n.FullName)
-            $fs.CopyTo($es)
-            $fs.Dispose(); $es.Dispose()
-            Write-Host "    + $entryName  $($n.Length) bytes"
+            $rel = "lib/arm64-v8a/$($n.Name)"
+            New-Item -ItemType Directory -Force -Path "lib\arm64-v8a" | Out-Null
+            Copy-Item $n.FullName "lib\arm64-v8a\$($n.Name)" -Force
+            & $jarExe uf "$BUILD\unsigned.apk" $rel
+            if ($LASTEXITCODE -ne 0) { throw "jar could not add $rel" }
+            Write-Host "    + $rel  $($n.Length) bytes"
         }
-    } finally { $zip.Dispose() }
+    } finally { Pop-Location }
 }
 
 Step "zipalign"

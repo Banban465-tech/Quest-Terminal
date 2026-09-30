@@ -235,20 +235,6 @@ String cwd = "";
         render();
     }
 
-    /** the tab label follows the transport, so a paired tab says where it is */
-    private String tabTitle(Session s) {
-        if (s.ps) return "pwsh";
-        if (sh instanceof AdbShell) {
-            String dev = ((AdbShell) sh).bin().device();
-            if (dev == null) dev = "";
-            String tail = dev;
-            int colon = tail.lastIndexOf(':');
-            if (colon > 0) tail = tail.substring(0, colon);
-            if (tail.startsWith("127.0.0.1") || tail.equals("localhost")) tail = "localhost";
-            return tail.length() > 0 ? "terminal - " + tail : "terminal";
-        }
-        return s.title;
-    }
 
     /**
      * Root won, so every later command goes through su instead of whatever was
@@ -1486,7 +1472,7 @@ String cwd = "";
         for (int i = 0; i < sessions.size(); i++) {
             final int idx = i;
             TextView t = new TextView(this);
-            t.setText(" " + tabTitle(sessions.get(i)) + " ");
+            t.setText(" " + sessions.get(i).title + " ");
             t.setTextSize(12);
             t.setTextColor(i == current ? 0xFF000000 : 0xFF9A9A9A);
             t.setBackgroundColor(i == current ? 0xFFC0C0C0 : 0xFF1A1A1A);

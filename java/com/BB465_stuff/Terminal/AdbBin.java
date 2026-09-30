@@ -101,7 +101,7 @@ final class AdbBin {
         cmd.add("-P");
         cmd.add(String.valueOf(SERVER_PORT));
         cmd.add("version");
-        Result r = exec(cmd, homeDir(ctx), DEFAULT_TIMEOUT_MS);
+        Result r = exec(cmd, homeDir(ctx), ADB_USER, adbHostname(), DEFAULT_TIMEOUT_MS);
         String out = r.out;
         if (out.length() == 0) out = "not runnable: " + firstLine(r.err);
         cachedVersion = out;
@@ -141,16 +141,48 @@ final class AdbBin {
      * tools can reuse the pump-and-timeout logic instead of forking their own;
      * home may be null when the command has no use for it.
      */
-    static Result exec(List<String> cmd, String home, int timeoutMs) {
+    /**
+     * The name this app announces when it pairs.
+     *
+     * adb builds it as USER + '@' + HOSTNAME, falling back to the logname and
+     * then to net.hostname. net.hostname is empty on a Quest and is not
+     * writable by a uid 2000 shell, so it falls back to a generated id and the
+     * paired-devices list ends up reading something like
+     * 'adb-<random>_localhost'. Setting both of these makes the entry read
+     * 'Terminal@localhost-Quest3' instead.
+     *
+     * ADB_WIFI_HOSTNAME would do the same in one variable, but this build does
+     * not have it - zero occurrences in the binary - so it is not an option.
+     */
+    static final String ADB_USER = "Terminal";
+
+    /** loopback, with a sanitised model so the result stays hostname-shaped */
+    static String adbHostname() {
+        String raw = android.os.Build.MODEL == null ? "" : android.os.Build.MODEL;
+        StringBuilder sb = new StringBuilder("localhost");
+        // spaces dropped: 'Quest 3' becomes 'Quest3'. A hostname with a space
+        // in it is not a hostname.
+        for (int i = 0; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    static Result exec(List<String> cmd, String home, String user, String hostname, int timeoutMs) {
         Result r = new Result();
         Process p = null;
         try {
             ProcessBuilder pb = new ProcessBuilder(cmd);
             pb.redirectErrorStream(true);
-            if (home != null) {
-                pb.environment().put("HOME", home);
-                pb.environment().put("TMPDIR", home);
-            }
+if (home != null) {
+                  pb.environment().put("HOME", home);
+                  pb.environment().put("TMPDIR", home);
+              }
+              if (user != null) pb.environment().put("USER", user);
+              if (hostname != null) pb.environment().put("HOSTNAME", hostname);
             p = pb.start();
             final Process proc = p;
             final StringBuilder sb = new StringBuilder();
@@ -197,7 +229,7 @@ public String run(String... args) {
           cmd.add("-P");
           cmd.add(String.valueOf(SERVER_PORT));
           for (String a : args) cmd.add(a);
-        Result r = exec(cmd, home, isSlow(args) ? LONG_TIMEOUT_MS : DEFAULT_TIMEOUT_MS);
+        Result r = exec(cmd, home, ADB_USER, adbHostname(), isSlow(args) ? LONG_TIMEOUT_MS : DEFAULT_TIMEOUT_MS);
         StringBuilder sb = new StringBuilder(r.out);
         if (r.err.length() > 0) {
             if (sb.length() > 0 && sb.charAt(sb.length() - 1) != '\n') sb.append('\n');
@@ -228,7 +260,7 @@ private Result raw(int timeoutMs, String... args) {
           cmd.add("-P");
           cmd.add(String.valueOf(SERVER_PORT));
           for (String a : args) cmd.add(a);
-        return exec(cmd, home, timeoutMs);
+        return exec(cmd, home, ADB_USER, adbHostname(), timeoutMs);
     }
 
     // ---------------------------------------------------------------- commands

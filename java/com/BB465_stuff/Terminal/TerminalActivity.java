@@ -254,12 +254,15 @@ String cwd = "";
     /** the adb client is now talking to this device; use it for commands */
     private void adoptAdb(String device) {
         if (shCb == null) shCb = makeCallback();
-        adbT = new AdbShell(this, device, shCb);
-        adbT.refreshUid();
-        setTransport(adbT, "adb: " + device);
-        pput("adbDev", device);
-        loadFacts();
-        render();
+adbT = new AdbShell(this, device, shCb);
+    adbT.refreshUid();
+    setTransport(adbT, "adb: " + device);
+    pput("adbDev", device);
+    // same as the shizuku path: without this the prompt and the startup banner
+    // never learn the codename, because only the shizuku callback used to ask
+    loadCodename(adbT);
+    loadFacts();
+    render();
     }
 
     private void adoptShizuku() {
@@ -2768,9 +2771,9 @@ String cwd = "";
     }
 
     /** ask the device what it is, once the transport is up */
-    private void loadCodename(final Shell s) {
+    private void loadCodename(final Transport t) {
         codename = adbPrefs().getString("codename", "");
-        s.execRaw("getprop ro.product.device; getprop ro.product.name; "
+        t.execRaw("getprop ro.product.device; getprop ro.product.name; "
                 + "getprop ro.build.product", new Shell.Raw() {
             public void got(String o) {
                 if (o == null) return;
@@ -2782,6 +2785,9 @@ String cwd = "";
                     if (t.equalsIgnoreCase("unknown")) continue;
                     codename = t.toLowerCase();
                     adbPrefs().edit().putString("codename", codename).apply();
+                    // the adb pairing name is built from this, so it has to be
+                    // set here rather than read separately per call
+                    AdbBin.codename = codename;
                     android.util.Log.i("BBterm", "codename=" + codename
                             + " model=" + modelName() + " prompt=" + prompt());
                     render();
@@ -3316,8 +3322,13 @@ String cwd = "";
               "echo model=$(getprop ro.product.model);"
             + " echo android=$(getprop ro.build.version.release);"
             + " echo api=$(getprop ro.build.version.sdk);"
-            + " echo build=$(getprop ro.build.display.id);"
-            + " echo fingerprint=$(getprop ro.build.fingerprint);"
++ " echo build=$(getprop ro.build.display.id);"
+              + " echo fingerprint=$(getprop ro.build.fingerprint);"
+              // firmware detail, so 'info' answers what version this is running
+              + " echo incremental=$(getprop ro.build.version.incremental);"
+              + " echo brand=$(getprop ro.product.brand);"
+              + " echo manufacturer=$(getprop ro.product.manufacturer);"
+              + " echo patch=$(getprop ro.build.version.security_patch);"
             + " echo serial=$(getprop ro.serialno);"
             + " echo uid=$(id -u);"
             + " echo toybox=$(command -v toybox 2>/dev/null || echo absent);"
@@ -3909,16 +3920,21 @@ sb.append("  termdev                  info | log | savelog | server | selftest\n
             return;
         }
         final StringBuilder sb = new StringBuilder();
-        final String[] keys = {
-            "model",     "getprop ro.product.model",
-            "android",   "getprop ro.build.version.release",
-            "build",     "getprop ro.build.version.display.id",
-            "serial",    "getprop ro.serialno",
-            "uid",       "id -u",
-            "selinux",   "getenforce",
-            "root",      "[ -e /product/bin/su ] && echo present || echo absent",
-            "adb port",  "getprop persist.adb.tcp.port",
-        };
+final String[] keys = {
+              "android",   "getprop ro.build.version.release",
+              "sdk",       "getprop ro.build.version.sdk",
+              "patch",     "getprop ro.build.version.security_patch",
+              "build",     "getprop ro.build.display.id",
+              "incremental", "getprop ro.build.version.incremental",
+              "model",     "getprop ro.product.model",
+              "brand",     "getprop ro.product.brand",
+              "made by",   "getprop ro.product.manufacturer",
+              "serial",    "getprop ro.serialno",
+              "uid",       "id -u",
+              "selinux",   "getenforce",
+              "root",      "[ -e /product/bin/su ] && echo present || echo absent",
+              "adb port",  "getprop persist.adb.tcp.port",
+          };
         fill(keys, 0, sb, body);
     }
 

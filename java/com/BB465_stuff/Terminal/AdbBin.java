@@ -156,9 +156,17 @@ final class AdbBin {
      */
     static final String ADB_USER = "Terminal";
 
-    /** loopback, with a sanitised model so the result stays hostname-shaped */
+    /**
+     * loopback, plus this headset's codename. Set once from the shell's
+     * ro.product.device so the announced name follows the device rather than a
+     * marketing string: 'eureka' is what identifies the hardware, 'Quest 3' is
+     * what it is sold as and the same on several models.
+     */
+    static String codename = "";
+
     static String adbHostname() {
-        String raw = android.os.Build.MODEL == null ? "" : android.os.Build.MODEL;
+        String raw = codename.length() > 0 ? codename
+                : (android.os.Build.MODEL == null ? "" : android.os.Build.MODEL);
         StringBuilder sb = new StringBuilder("localhost");
         // spaces dropped: 'Quest 3' becomes 'Quest3'. A hostname with a space
         // in it is not a hostname.

@@ -305,7 +305,7 @@ adbT = new AdbShell(this, device, shCb);
             append("adb client:  not in this build\n");
         }
         append("su:          " + describeSuOnDisk() + "\n");
-        append("\nnothing is running commands yet. wireless adb is the default:\n\n");
+        append("\nnothing is running commands yet. shizuku is tried first, then adb:\n\n");
         append("  1. wireless adb   pairs once with 'adbsetup', then this app\n");
         append("                    connects on its own at every launch. no root,\n");
         append("                    no Shizuku.\n");
@@ -333,8 +333,32 @@ adbT = new AdbShell(this, device, shCb);
                 }
             }).start();
         } else {
-            autoConnectAdb(adbSaved);
+            // Shizuku first, adb only if that does not come up. The banner used
+            // to lead with adb as 'the default', which meant a headset with a
+            // working Shizuku grant still went down the pairing path first and
+            // printed a connect attempt every launch.
+            if (!tryShizukuThenAdb(adbSaved)) {
+                autoConnectAdb(adbSaved);
+            }
         }
+    }
+
+    /**
+     * Give Shizuku a moment to answer before falling back to adb. Shizuku binds
+     * its UserService asynchronously, so returning 'not ready' immediately would
+     * skip it on every launch and land straight back on adb.
+     *
+     * @return true if a Shizuku transport took over, so adb should not be tried
+     */
+    private boolean tryShizukuThenAdb(final String adbSaved) {
+        final boolean granted = pon("shizukuGranted", false);
+        if (!granted) return false;
+        connectShell();
+        for (int i = 0; i < 30; i++) {
+            if (sh != null && sh.isReady()) return true;
+            try { Thread.sleep(200); } catch (InterruptedException e) { break; }
+        }
+        return sh != null && sh.isReady();
     }
 
     /**
@@ -2523,7 +2547,38 @@ adbT = new AdbShell(this, device, shCb);
                     + "termdev log [n]         last n lines from logcat (default 200)\n"
                     + "termdev savelog <dir>   write those lines to <dir>/bbterm.log\n"
                     + "termdev server          which adb server answers, and whose\n"
+                    + "termdev adb <args...>    run the bundled adb directly\n"
                     + "termdev selftest        what is reachable from in here\n\n");
+            return;
+        }
+
+        if (sub.equals("adb")) {
+            // straight passthrough to the bundled adb, so anything this app has
+            // no command for is still reachable: 'termdev adb devices',
+            // 'termdev adb -s 127.0.0.1:5555 shell ls', and so on.
+            if (a.length < 2) {
+                append("termdev adb <args...>    run the bundled adb directly\n"
+                        + "  e.g. termdev adb devices\n"
+                        + "       termdev adb -s 127.0.0.1:5555 shell id -u\n"
+                        + "       termdev adb reconnect\n\n");
+                return;
+            }
+            final String[] rest = new String[a.length - 1];
+            System.arraycopy(a, 1, rest, 0, rest.length);
+            adbJob(s, new java.util.concurrent.Callable<String>() {
+                public String call() {
+                    if (!AdbBin.available(TerminalActivity.this)) {
+                        return "no adb client in this build.\n";
+                    }
+                    AdbBin b = adbBin(pget("adbDev", loopback(adbDevicePort())));
+                    StringBuilder sb = new StringBuilder("$ adb");
+                    for (String r : rest) sb.append(' ').append(r);
+                    sb.append('\n');
+                    String out = b.run(rest);
+                    sb.append(out.length() > 0 ? out : "(no output)\n");
+                    return sb.toString();
+                }
+            });
             return;
         }
 
@@ -2788,6 +2843,13 @@ adbT = new AdbShell(this, device, shCb);
                     // the adb pairing name is built from this, so it has to be
                     // set here rather than read separately per call
                     AdbBin.codename = codename;
+                    // and the server has to be restarted to use it. adb is a
+                    // client to a long-lived server, and it is the server that
+                    // announces the name, using the environment it inherited when
+                    // it was first spawned - which was during warmVersion, long
+                    // before the codename was known. Re-advertising on later
+                    // calls does nothing, they only talk to a socket.
+                    AdbBin.restartForCodename(TerminalActivity.this, codename);
                     android.util.Log.i("BBterm", "codename=" + codename
                             + " model=" + modelName() + " prompt=" + prompt());
                     render();

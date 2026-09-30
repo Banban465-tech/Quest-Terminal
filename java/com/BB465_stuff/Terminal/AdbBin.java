@@ -179,6 +179,53 @@ final class AdbBin {
         return sb.toString();
     }
 
+    /**
+     * The server announces the name, and it inherited its environment when it was
+     * first spawned - during warmVersion, before the codename was known. Once
+     * the codename turns up, restart the server so the next pairing announces the
+     * right thing.
+     *
+     * Runs off the caller's thread. It kills a server this app owns on its own
+     * private port, so nothing else is touched, but it does interrupt anything
+     * in flight, so it waits for the codename to actually change rather than
+     * firing on every resolve.
+     */
+    static void restartForCodename(final Context ctx, final String codename) {
+        if (codename == null || codename.length() == 0) return;
+        final String bin = binaryPath(ctx);
+        if (bin == null) return;
+        final String home = homeDir(ctx);
+        final String want = adbHostname();
+        if (want.equals(announced)) return;
+        announced = want;
+        Thread th = new Thread(new Runnable() {
+            public void run() {
+                try {
+                    List<String> kill = new ArrayList<String>();
+                    kill.add(bin);
+                    kill.add("-P");
+                    kill.add(String.valueOf(SERVER_PORT));
+                    kill.add("kill-server");
+                    exec(kill, home, ADB_USER, want, 10000);
+
+                    List<String> start = new ArrayList<String>();
+                    start.add(bin);
+                    start.add("-P");
+                    start.add(String.valueOf(SERVER_PORT));
+                    start.add("start-server");
+                    exec(start, home, ADB_USER, want, 15000);
+                    Log.i(TAG, "adb server restarted, announces " + ADB_USER + '@' + want);
+                } catch (Throwable t) {
+                    Log.w(TAG, "could not restart the adb server", t);
+                }
+            }
+        }, "bbterm-adb-restart");
+        th.setDaemon(true);
+        th.start();
+    }
+
+    private static volatile String announced = "";
+
     static Result exec(List<String> cmd, String home, String user, String hostname, int timeoutMs) {
         Result r = new Result();
         Process p = null;

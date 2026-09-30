@@ -1228,7 +1228,15 @@ public class TerminalActivity extends Activity {
         tabBar = new LinearLayout(this);
         tabBar.setOrientation(LinearLayout.HORIZONTAL);
         tabBar.setBackgroundColor(0xFF0C0C0C);
-        root.addView(tabBar);
+        // Height has to be pinned. Added without params the bar's height is
+        // unspecified, and a horizontal LinearLayout holding a weighted child
+        // (the spacer that pushes the version into the corner) stretches to
+        // fill the parent. It then takes all the vertical space and leaves the
+        // output ScrollView, which is height 0 weight 1, with nothing - so the
+        // terminal pane never draws.
+        root.addView(tabBar, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
 
         scroll = new ScrollView(this);
         output = new TextView(this);
@@ -1449,8 +1457,7 @@ public class TerminalActivity extends Activity {
 
         // spacer then version, so it sits in the far corner of the bar
         View gap = new View(this);
-        tabBar.addView(gap, new LinearLayout.LayoutParams(0,
-                LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        tabBar.addView(gap, new LinearLayout.LayoutParams(0, dp(1), 1f));
         TextView ver = new TextView(this);
         ver.setText(versionCorner());
         ver.setTextSize(11);

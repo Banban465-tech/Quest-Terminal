@@ -49,8 +49,15 @@ public class TerminalActivity extends Activity {
                 new android.text.SpannableStringBuilder();
         final List<String> history = new ArrayList<String>();
         int histPos = 0;
-        String cwd = "";
-        String title = "sh";
+String cwd = "";
+          String title = "sh";
+          /**
+           * how much of buf is the startup banner. While the buffer is still
+           * exactly this long nothing has been typed, so the banner can be
+           * rewritten when the transport changes. Past it, the banner is
+           * history and only gets a fresh status line appended.
+           */
+          int bannerLen;
         Thread worker;
         volatile boolean busy;
         /** true while this tab is driving a live PowerShell session */
@@ -202,6 +209,45 @@ public class TerminalActivity extends Activity {
             }
         }
         if (status != null) status.setText(note);
+    refreshBanner();
+    }
+
+    /**
+     * The startup banner says what the transport was when the tab opened, so a
+     * tab that began as "no transport" stays wrong after adbsetup pairs. While
+     * nothing has been typed the banner is rewritten; once there is real output
+     * under it, the banner is history and only a status line is added.
+     */
+    private void refreshBanner() {
+        if (sessions.isEmpty()) return;
+        Session s = sessions.get(current);
+        if (s.ps || s.bannerLen == 0) return;
+        if (s.buf.length() > s.bannerLen) {
+            append("transport is now " + transportLine() + "\n");
+            appendPrompt();
+            return;
+        }
+        // buf is a SpannableStringBuilder, so clear() rather than setLength(0)
+        s.buf.clear();
+        s.buf.append(headset() + " - " + transportLine() + "\n"
+                + "type 'help' for the full command list\n\n");
+        s.bannerLen = s.buf.length();
+        render();
+    }
+
+    /** the tab label follows the transport, so a paired tab says where it is */
+    private String tabTitle(Session s) {
+        if (s.ps) return "pwsh";
+        if (sh instanceof AdbShell) {
+            String dev = ((AdbShell) sh).bin().device();
+            if (dev == null) dev = "";
+            String tail = dev;
+            int colon = tail.lastIndexOf(':');
+            if (colon > 0) tail = tail.substring(0, colon);
+            if (tail.startsWith("127.0.0.1") || tail.equals("localhost")) tail = "localhost";
+            return tail.length() > 0 ? "terminal - " + tail : "terminal";
+        }
+        return s.title;
     }
 
     /**
@@ -309,6 +355,10 @@ public class TerminalActivity extends Activity {
      * was needs 'adbsetup' once, and the message says so.
      */
     private void autoConnectAdb(String savedDev) {
+        // nothing to do if a transport is already answering. Without this the
+        // startup path and the su-refused path both land here and the
+        // "connecting the adb client to..." line lands in the buffer every time.
+        if (sh != null && sh.isReady()) return;
         if (!AdbBin.available(this)) {
             append("no adb client in this build, so 'adbsetup' cannot run.\n");
             appendPrompt();
@@ -1330,18 +1380,19 @@ public class TerminalActivity extends Activity {
         bar.addView(sysBtn, new LinearLayout.LayoutParams(dp(56), dp(48)));
 
         // permissions as a button, because the grant can be revoked by accident
-        // and hunting for a command on a headset keyboard is the wrong way to
-        // find out whether the shell is actually there
-        TextView accBtn = new TextView(this);
-        accBtn.setText("ACCESS");
-        accBtn.setTextColor(0xFFEDEDF2);
-        accBtn.setTextSize(11);
-        accBtn.setGravity(Gravity.CENTER);
-        accBtn.setBackgroundColor(0xFF2A2A2A);
-        accBtn.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) { requestShellAccess(); }
+        // update check, where a person will actually look. This was ACCESS,
+        // which asked Shizuku for access even when wireless adb was already
+        // up and running the commands, so it was a button that did nothing.
+        TextView updBtn = new TextView(this);
+        updBtn.setText("\u27F3");
+        updBtn.setTextColor(0xFFEDEDF2);
+        updBtn.setTextSize(15);
+        updBtn.setGravity(Gravity.CENTER);
+        updBtn.setBackgroundColor(0xFF2A2A2A);
+        updBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { showUpdateDialog(); }
         });
-        bar.addView(accBtn, new LinearLayout.LayoutParams(dp(64), dp(48)));
+        bar.addView(updBtn, new LinearLayout.LayoutParams(dp(64), dp(48)));
 
         // preferences as a real button. Chasing fonts, colors and scrollback
         // should not require typing a command into a headset keyboard.
@@ -1435,7 +1486,7 @@ public class TerminalActivity extends Activity {
         for (int i = 0; i < sessions.size(); i++) {
             final int idx = i;
             TextView t = new TextView(this);
-            t.setText(" " + sessions.get(i).title + " ");
+            t.setText(" " + tabTitle(sessions.get(i)) + " ");
             t.setTextSize(12);
             t.setTextColor(i == current ? 0xFF000000 : 0xFF9A9A9A);
             t.setBackgroundColor(i == current ? 0xFFC0C0C0 : 0xFF1A1A1A);
@@ -1492,6 +1543,7 @@ public class TerminalActivity extends Activity {
         s.uid = sh == null ? 2000 : sh.uid();
         s.buf.append(headset() + " - " + transportLine() + "\n"
                    + "type 'help' for the full command list\n\n");
+        s.bannerLen = s.buf.length();
         sessions.add(s);
         current = sessions.size() - 1;
         render();
@@ -1802,7 +1854,8 @@ public class TerminalActivity extends Activity {
                 pput("updStart", v);
                 self.setText("check on startup   " + v);
             }
-        }));
+        }));
+
 
         box.addView(button("close", 0xFF14141A, new Tap() {
             public void run(TextView self) { dlg.dismiss(); }

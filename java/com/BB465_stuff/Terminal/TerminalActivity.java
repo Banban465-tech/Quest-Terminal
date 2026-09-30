@@ -667,6 +667,13 @@ public class TerminalActivity extends Activity {
         return pget(key, def ? "on" : "off").equals("on");
     }
 
+    // pget only returns values it finds in PREFS, so keys the update menu owns
+    // need this instead or they would silently read back as the default
+    private String praw(String key, String def) {
+        String v = adbPrefs().getString(key, null);
+        return v == null ? def : v;
+    }
+
     private int pint(String key, int def) {
         try { return Integer.parseInt(pget(key, String.valueOf(def))); }
         catch (NumberFormatException e) { return def; }
@@ -1439,6 +1446,36 @@ public class TerminalActivity extends Activity {
             public void onClick(View v) { newSession(); }
         });
         tabBar.addView(plus);
+
+        // spacer then version, so it sits in the far corner of the bar
+        View gap = new View(this);
+        tabBar.addView(gap, new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        TextView ver = new TextView(this);
+        ver.setText(versionCorner());
+        ver.setTextSize(11);
+        ver.setTextColor(0xFF5A5A5A);
+        ver.setGravity(Gravity.CENTER_VERTICAL | Gravity.RIGHT);
+        ver.setPadding(dp(8), dp(6), dp(10), dp(6));
+        ver.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { showUpdateDialog(); }
+        });
+        tabBar.addView(ver);
+    }
+
+    /** "v2.0" normally, "v2.0 -> 1.2.4" once an update has been spotted */
+    private String versionCorner() {
+        String v = myVersion();
+        String newer = praw("updSeen", "");
+        if (newer.length() == 0) return "v" + v;
+        return "v" + v + " \u2192 " + newer;
+    }
+
+    private void doCredits(Session s) {
+        append("credits to:\n"
+             + "  FreeXR      https://discord.gg/ABCXxDyqrH\n"
+             + "  yanno1222 / .networth_\n"
+             + "  Kotlin- / gamble_now\n\n");
     }
 
     private void newSession() {
@@ -1478,6 +1515,8 @@ public class TerminalActivity extends Activity {
             || verb.equals("adbuse") || verb.equals("adbshizuku")
             || verb.equals("info") || verb.equals("rootcheck") || verb.equals("commands")
             || verb.equals("pkg") || verb.equals("run") || verb.equals("su")
+            || verb.equals("update") || verb.equals("updates") || verb.equals("credits")
+            || verb.equals("disableupdates") || verb.equals("enableupdates")
             || verb.equals("pwshfile") || verb.equals("pwshdemo");
     }
 
@@ -1531,6 +1570,9 @@ public class TerminalActivity extends Activity {
         + "  grantapp <pkg> <perm>     pm grant\n"
         + "  revokeapp <pkg> <perm>    pm revoke\n"
         + "  resetperms <pkg>          pm reset-permissions -p\n\n"
+        + "  update                    check github for a newer build, install from a menu\n"
+        + "  disableupdates            point the ota urls at loopback\n"
+        + "  enableupdates             put the stock ota urls back\n\n"
 
         + "-- intents ----------------------------------------------------\n"
         + "  openurl <url>             am start VIEW\n"
@@ -1687,6 +1729,186 @@ public class TerminalActivity extends Activity {
     private void doResetPerms(String arg, Session s) {
         if (arg == null || arg.trim().isEmpty()) { append("resetperms <pkg>\n"); return; }
         dev(s, echo("resetperms", arg), "pm reset-permissions -p " + arg.trim());
+    }
+
+    /**
+     * Point both OTA urls at loopback so an update cannot be fetched, and delete
+     * them again to hand the stock servers back. A headset on the Quest store
+     * path has no use for Horizon OS updates, and the download can wedge the
+     * updater in the background where it is hard to notice.
+     */
+    private void doOta(String arg, Session s, boolean block) {
+        String[] keys = { "ota_update_server_url", "ota_download_url" };
+        StringBuilder cmd = new StringBuilder();
+        for (String k : keys) {
+            if (cmd.length() > 0) cmd.append("; ");
+            cmd.append("settings ").append(block ? "put" : "delete")
+               .append(" global ").append(k)
+               .append(block ? " http://127.0.0.1/" : "");
+        }
+        dev(s, echo(block ? "disableupdates" : "enableupdates", arg), cmd.toString());
+    }
+
+    /** versionName out of the manifest, so the menu never quotes a stale literal */
+    private String myVersion() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Throwable t) {
+            return "?";
+        }
+    }
+
+    /**
+     * Update menu: current version, check, check-on-startup. Nothing is installed
+     * from here without a tap on the install row, and the row only appears once
+     * an apk is actually on disk.
+     */
+    private void showUpdateDialog() {
+        final String mine = myVersion();
+
+        final android.app.Dialog dlg = new android.app.Dialog(this);
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(18), dp(16), dp(18), dp(12));
+        box.setBackgroundColor(0xFF0A0A0A);
+
+        TextView head = new TextView(this);
+        head.setText("Update");
+        head.setTextColor(0xFFCCCCCC);
+        head.setTextSize(17);
+        box.addView(head);
+
+        final TextView status = new TextView(this);
+        status.setText("installed  v" + mine);
+        status.setTextColor(0xFF7A7A7A);
+        status.setTextSize(11);
+        box.addView(status);
+
+        box.addView(button("check for updates", 0xFF20242E, new Tap() {
+            public void run(TextView self) { checkForUpdate(dlg, box, status, mine); }
+        }));
+
+        box.addView(button("check on startup   " + (praw("updStart", "off").equals("on") ? "on" : "off"),
+                0xFF14141A, new Tap() {
+            public void run(TextView self) {
+                String v = praw("updStart", "off").equals("on") ? "off" : "on";
+                pput("updStart", v);
+                self.setText("check on startup   " + v);
+            }
+        }));
+
+        box.addView(button("close", 0xFF14141A, new Tap() {
+            public void run(TextView self) { dlg.dismiss(); }
+        }));
+
+        dlg.setContentView(box);
+        dlg.show();
+    }
+
+    /** a row handler gets the row, so it can relabel or disable itself */
+    private interface Tap {
+        void run(TextView self);
+    }
+
+    private TextView button(String label, int bg, final Tap onTap) {
+        TextView t = new TextView(this);
+        t.setText(label);
+        t.setTextColor(0xFFCCCCCC);
+        t.setTextSize(13);
+        t.setPadding(dp(12), dp(12), dp(12), dp(12));
+        t.setBackgroundColor(bg);
+        t.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { onTap.run(t); }
+        });
+        return t;
+    }
+
+    private void checkForUpdate(final android.app.Dialog dlg, final LinearLayout box,
+                                final TextView status, final String mine) {
+        status.setText("checking github...");
+        new Thread(new Runnable() {
+            public void run() {
+                String msg;
+                Updater.Release r = null;
+                try {
+                    r = Updater.latest();
+                    if (r == null) msg = "no releases with an apk yet";
+                    else if (!Updater.newerThan(r, mine)) msg = "up to date, " + r.label() + " is the newest";
+                    else msg = r.label() + " is available";
+                } catch (Throwable t) {
+                    msg = "check failed: " + t.getMessage();
+                }
+                final Updater.Release found = r;
+                final String text = msg;
+                final boolean ok = found != null && Updater.newerThan(found, mine);
+                runOnUiThread(new Runnable() {
+                    public void run() {
+                        status.setText(text);
+                        if (ok) {
+                            // show it in the corner too, so the menu is findable later
+                            pput("updSeen", found.label());
+                            render();
+                            addInstallRow(box, status, found, mine);
+                        }
+                    }
+                });
+            }
+        }, "bbterm-update-check").start();
+    }
+
+    /** download, then hand the file to the transport for pm install - never automatic */
+    private void addInstallRow(final LinearLayout box, final TextView status,
+                               final Updater.Release r, final String mine) {
+        final TextView row = button("download and install " + r.label(), 0xFF1B2A1B, new Tap() {
+            public void run(TextView self) {
+                self.setEnabled(false);
+                status.setText("downloading 0%");
+                new Thread(new Runnable() {
+                    public void run() {
+                        String msg;
+                        try {
+                            final java.io.File f = Updater.download(r.url, new Updater.Progress() {
+                                public void progress(final int pct) {
+                                    runOnUiThread(new Runnable() {
+                                        public void run() { status.setText("downloading " + pct + "%"); }
+                                    });
+                                }
+                            });
+                            msg = installUpdate(f, mine);
+                        } catch (Throwable t) {
+                            msg = "download failed: " + t.getMessage();
+                        }
+                        final String text = msg;
+                        runOnUiThread(new Runnable() {
+                            public void run() {
+                                status.setText(text);
+                                self.setEnabled(true);
+                            }
+                        });
+                    }
+                }, "bbterm-update-dl").start();
+            }
+        });
+        // land it above the close row
+        box.addView(row, Math.max(0, box.getChildCount() - 1));
+    }
+
+    /** push the apk somewhere writable and let pm replace us with it */
+    private String installUpdate(java.io.File f, String mine) {
+        final Transport t = sh;
+        if (t == null || !t.isReady()) {
+            return "downloaded, but no transport. pair adb or start shizuku, then 'update' again";
+        }
+        String remote = "/data/local/tmp/bbupdate.apk";
+        String up;
+        try {
+            up = t.uploadTo(f, remote);
+        } catch (Throwable e) {
+            return "upload failed: " + e.getMessage();
+        }
+        if (up != null && up.startsWith("error")) return "upload failed: " + up;
+        t.exec("pm install -r " + remote);
+        return "installing, the app restarts if it succeeds";
     }
 
     private void doSms(String arg, Session s) {
@@ -2477,6 +2699,10 @@ public class TerminalActivity extends Activity {
         if (verb.equals("grantapp"))   { doPerm(arg, s, "grant"); return true; }
         if (verb.equals("revokeapp"))  { doPerm(arg, s, "revoke"); return true; }
         if (verb.equals("resetperms")) { doResetPerms(arg, s); return true; }
+        if (verb.equals("update") || verb.equals("updates")) { showUpdateDialog(); return true; }
+        if (verb.equals("credits")) { doCredits(s); return true; }
+        if (verb.equals("disableupdates")) { doOta(arg, s, true); return true; }
+        if (verb.equals("enableupdates"))  { doOta(arg, s, false); return true; }
         if (verb.equals("openurl"))    { dev(s, echo("openurl", arg), "am start -a android.intent.action.VIEW -d " + q(arg)); return true; }
         if (verb.equals("tel"))        { dev(s, echo("tel", arg), "am start -a android.intent.action.CALL -d tel:" + arg); return true; }
         if (verb.equals("sms"))        { doSms(arg, s); return true; }

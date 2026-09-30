@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- No <monochrome> layer on purpose. The artwork is built from a green
+     chevron, a white input pill and a green underscore; flattened to one
+     silhouette for a themed icon that turns into an unreadable blob. A themed
+     icon that falls back to the full-colour one beats a correct-shaped wrong
+     one. -->
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@color/ic_launcher_background" />
     <foreground android:drawable="@mipmap/ic_launcher_foreground" />
-    <monochrome android:drawable="@mipmap/ic_launcher_foreground" />
 </adaptive-icon>

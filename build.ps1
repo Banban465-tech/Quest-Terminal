@@ -125,6 +125,34 @@ Step "add classes.dex"
 & $jarExe --update --file "$BUILD\unsigned.apk" -C "$BUILD\dex" classes.dex
 if ($LASTEXITCODE -ne 0) { throw "jar update failed" }
 
+# Native libraries. adb ships as lib/arm64-v8a/libadb.so on purpose: it is the
+# only executable thing an app can carry, because the package manager extracts
+# lib/* with the exec bit already set into nativeLibraryDir, which is not
+# app-writable so the Android 10 write-execute rule never applies. A binary
+# dropped in the app's data dir cannot be exec'd at all.
+$jni = "$ROOT\libs\arm64-v8a"
+$natives = @(Get-ChildItem $jni -Filter *.so -ErrorAction SilentlyContinue)
+if ($natives.Count -eq 0) {
+    Write-Warning "  no .so in libs\arm64-v8a - adbsetup will report 'not in this build'"
+} else {
+    Step "add native libs"
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::Open("$BUILD\unsigned.apk", 'Update')
+    try {
+        foreach ($n in $natives) {
+            $entryName = "lib/arm64-v8a/$($n.Name)"
+            $old = $zip.GetEntry($entryName)
+            if ($old) { $old.Delete() }
+            $entry = $zip.CreateEntry($entryName, [System.IO.Compression.CompressionLevel]::Optimal)
+            $es = $entry.Open()
+            $fs = [System.IO.File]::OpenRead($n.FullName)
+            $fs.CopyTo($es)
+            $fs.Dispose(); $es.Dispose()
+            Write-Host "    + $entryName  $($n.Length) bytes"
+        }
+    } finally { $zip.Dispose() }
+}
+
 Step "zipalign"
 & "$BT\zipalign.exe" -f -p 4 "$BUILD\unsigned.apk" "$BUILD\aligned.apk"
 if ($LASTEXITCODE -ne 0) { throw "zipalign failed" }

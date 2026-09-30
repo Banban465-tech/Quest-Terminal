@@ -25,3 +25,5 @@ build-local.ps1
 .vscode/
 .DS_Store
 Thumbs.db
+
+# yanno's build variant, kept for the aidl path; needs libs\*.aar to run

@@ -113,7 +113,27 @@ Tinos and Open Sans SemiCondensed, both Apache 2.0. See `res/font/NOTICE.txt`.
 
 ## License
 
-No license file yet. Add one if you intend to share this.
+Apache License 2.0, see [LICENSE](LICENSE).
+
+Bundled or required at runtime, all Apache 2.0 as well:
+
+| | |
+|---|---|
+| Shizuku | https://github.com/RikkaApps/Shizuku |
+| Tinos, Open Sans SemiCondensed | `res/font/NOTICE.txt` |
+| `libadb.so` | Android platform-tools, from AOSP |
+
+`libadb.so` ships as a native library rather than a resource so the package
+manager extracts it with the execute bit set - it is the one place an
+unprivileged app can run a binary from.
+
+## Credits
+
+- [FreeXR](https://discord.gg/ABCXxDyqrH)
+- yanno1222 / .networth_
+- Kotlin- / gamble_now
+
+`credits` in the app prints the same list.
 
 ## Project stats
 

@@ -27,3 +27,5 @@ build-local.ps1
 Thumbs.db
 
 # yanno's build variant, kept for the aidl path; needs libs\*.aar to run
+# Shizuku jars are supplied by the builder, see README
+shizuku_lib/

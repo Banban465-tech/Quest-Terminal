@@ -29,9 +29,9 @@ class AppleSource {
     private static final int TIMEOUT_MS = 30000;
     private static final String NAME = "badapple.mp4";
 
-    /** the canonical copy, kept outside the repo's release assets */
+    /** the canonical copy, served from a release asset on the repo */
     static final String DEFAULT_URL =
-            "https://github.com/Banban465-tech/Quest-Terminal/releases/download/badapple/badapple.mp4";
+            "https://github.com/Banban465-tech/Quest-Terminal/releases/download/ignorethislol/badapple.mp4";
 
     static File cached(Context ctx) {
         return new File(ctx.getCacheDir(), NAME);

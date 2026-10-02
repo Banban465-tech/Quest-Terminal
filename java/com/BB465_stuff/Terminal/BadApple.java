@@ -1,24 +1,25 @@
 package com.BB465_stuff.Terminal;
 
 import android.content.Context;
-import android.graphics.Bitmap;
-import android.graphics.Canvas;
 import android.graphics.Matrix;
-import android.graphics.PorterDuff;
+import android.graphics.SurfaceTexture;
 import android.media.MediaMetadataRetriever;
 import android.media.MediaPlayer;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.SystemClock;
+import android.util.Log;
+import android.view.Gravity;
+import android.view.Surface;
+import android.view.TextureView;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.ImageView;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 
 import java.io.File;
 
 /**
- * Bad Apple as a frame overlay instead of terminal output.
+ * Bad Apple as a video overlay instead of terminal output.
  *
  * Drawing the frames into the scrollback is the obvious way and it is a trap:
  * every tick appends a full screen of characters to the session's
@@ -27,81 +28,104 @@ import java.io.File;
  * re-layout of the text view on every one of them. So the pictures get their
  * own view inside the terminal pane and the scrollback keeps what it had.
  *
- * Frames are decoded sequentially and converted to the display rate, never
- * seeked to by timestamp. Both of the obvious alternatives are wrong here, in
- * opposite directions:
+ * The overlay hands the file to MediaPlayer and gets out of the way. That is
+ * several implementations late, and the reasons are worth keeping, because
+ * each one looked reasonable at the time:
  *
- *   - one seek per displayed frame, asking for the nearest sync frame, is
- *     fast but returns the SAME frame for every tick between keyframes, which
- *     is not slow playback, it is a freeze. This file has sparse keyframes.
- *   - asking for the exact frame with OPTION_CLOSEST decodes forward from the
- *     previous keyframe on every call, so twelve requests a second repeat most
- *     of every group of pictures and it plays at a third of speed.
+ *   - getFrameAtTime per frame, OPTION_CLOSEST_SYNC, returns the nearest
+ *     keyframe, so with sparse keyframes it shows the same image for every
+ *     tick in between. Not slow playback, a freeze.
+ *   - OPTION_CLOSEST decodes forward from the previous keyframe on every call,
+ *     redoing most of every group of pictures, twelve times a second.
+ *   - one decoded frame per tick against the audio clock plays a 30fps source
+ *     2.5x.
+ *   - keeping one in every srcFps/fps fixes the speed and passes every memory
+ *     check, then dies about a minute in, because getFramesAtIndex is O(index):
+ *     it re-seeks to the start of the file and counts forward to the frame you
+ *     asked for, so each pass costs more than the time it covers.
  *
- * So: walk the frames in order, decode a short run at a time, and keep one out
- * of every srcFps/fps. Because the walk is sequential the decoder never has to
- * seek, and because the keeps are counted against the source rate rather than
- * assumed, the speed is right whether the source is 24, 25, 30 or 60fps.
- *
- * Frames are picked by an accumulator rather than a fixed stride, because the
- * ratio is usually not a whole number. 30fps shown at 12fps is two and a half
- * source frames per displayed frame, and a stride of 3 would drift 20% by the
- * end of the video.
- *
- * Bitmaps belong to the UI thread. The worker never frees one, because the
- * render thread can still be drawing a frame that setImageBitmap has already
- * replaced, and recycling that is a hard crash. Retired frames go back through
- * a delayed post so they outlive the draw that was using them.
+ * MediaMetadataRetriever is a metadata tool, not a player. It keeps no state
+ * between calls, so every frame costs a seek. Android's hardware decoder has
+ * all the state, is clocked by the audio track, and drops and repeats frames on
+ * its own. SurfaceView plus MediaPlayer is the answer, with one caveat learned
+ * the hard way: a SurfaceView is a separate compositor layer, and on this
+ * headset it came out as a small black rectangle in the corner. A TextureView
+ * is an ordinary view, so it composites and lays out like one.
  */
 class BadApple {
+
+    private static final String TAG = "BBTerminal";
 
     /** reports back into the terminal */
     interface Say { void say(String s); }
 
     /**
-     * Frames are held this long after being replaced before being freed. One
-     * frame is 83ms at 12fps, so this comfortably covers a draw pass that
-     * started before the swap.
+     * An ordinary view that happens to be a video target. Black, tap-to-stop,
+     * and sized by the parent to the video's aspect ratio.
      */
-    private static final int RETIRE_GRACE_MS = 400;
+    private static class Pane extends TextureView
+            implements TextureView.SurfaceTextureListener {
+        final BadApple owner;
 
-    /**
-     * Source frames decoded per pass. Sequential, so the decoder never seeks,
-     * but each one is a real Bitmap, so this is not free. Six at 640x480 is
-     * about 7MB held briefly, which is what it takes to be able to keep one in
-     * three and still not stall the worker.
-     */
-    private static final int RUN = 6;
+        Pane(Context c, BadApple owner) {
+            super(c);
+            this.owner = owner;
+            setOpaque(true);
+            setClickable(true);
+            setFocusable(false);
+            setOnClickListener(new OnClickListener() {
+                public void onClick(View v) { owner.stop("stopped"); }
+            });
+            setSurfaceTextureListener(this);
+        }
 
-    /** how many ready-to-show frames may sit ahead of the clock */
-    private static final int QUEUE_MAX = 6;
+        @Override
+        public void onSurfaceTextureAvailable(SurfaceTexture st, int w, int h) {
+            owner.attachSurface(new Surface(st));
+        }
 
-    private final Context ctx;
+        @Override
+        public void onSurfaceTextureSizeChanged(SurfaceTexture st, int w, int h) { }
+
+        @Override
+        public boolean onSurfaceTextureDestroyed(SurfaceTexture st) {
+            owner.detachSurface();
+            // we dropped our own reference in detachSurface, so the framework
+            // is free to release the texture
+            return true;
+        }
+
+        @Override
+        public void onSurfaceTextureUpdated(SurfaceTexture st) { }
+    }
+
     /**
      * The terminal pane's parent, not the window. The overlay takes the scroll
      * view's slot so the input bar and status line stay on screen: a
      * full-window overlay hid the very command that stops it, along with the
      * message saying what is playing.
      */
+    private final Context ctx;
     private final ViewGroup host;
     private final int index;
     private final Say say;
     private final String path;
-    private final int fps;
     private final boolean loop;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
 
-    private ImageView view;
+    /** fills the pane, and centres the video inside itself */
+    private FrameLayout wrap;
+    private Pane pane;
     private MediaPlayer player;
-    private MediaMetadataRetriever retriever;
-    private Thread worker;
-    private volatile boolean dead;
-    private volatile boolean ended;
+    private boolean dead;
 
-    /** ready-to-show frames waiting for their moment. worker thread only. */
-    private final java.util.ArrayDeque<Bitmap> queue =
-            new java.util.ArrayDeque<Bitmap>();
+    private Surface surface;
+    private boolean surfaceLive;
+    private boolean displaySet;
+    private boolean wantPlay;
+    private volatile boolean renderedStart;
+    private boolean warnedNoPicture;
 
     BadApple(Context ctx, ViewGroup host, int index, Say say,
              String path, int fps, boolean loop) {
@@ -110,8 +134,11 @@ class BadApple {
         this.index = index;
         this.say = say;
         this.path = path;
-        this.fps = fps < 1 ? 12 : fps;
         this.loop = loop;
+        // fps is accepted and ignored. it only meant something while the
+        // frames were being pulled by hand, and it was a way to get the speed
+        // wrong rather than a way to set it. the decoder runs at the rate the
+        // file and the music agree on.
     }
 
     // ------------------------------------------------------------- lifecycle
@@ -123,285 +150,283 @@ class BadApple {
             return "badapple: no file at " + path + "\n";
         }
 
-        retriever = new MediaMetadataRetriever();
-        try {
-            retriever.setDataSource(f.getAbsolutePath());
-        } catch (Exception e) {
-            releaseQuietly();
-            return "badapple: " + f.getName() + " is not a video this can read\n"
-                    + "  " + e.getClass().getSimpleName() + ": " + e.getMessage() + "\n";
+        long durationUs = probeDuration(f);
+        String dims = probeDims(f);
+        if (dims == null) {
+            return "badapple: " + f.getName() + " has no video track\n";
         }
-
-        final long durationUs = longMeta(MediaMetadataRetriever.METADATA_KEY_DURATION, 0L);
-        int rot = intMeta(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION, 0);
-        // how many source frames there are, which is what gives the real source
-        // rate. without it the rate conversion has to assume, and assuming is
-        // how the speed ended up wrong twice already.
-        int frameCount = intMeta(MediaMetadataRetriever.METADATA_KEY_VIDEO_FRAME_COUNT, 0);
-        int rateCalc = fps;
-        String srcNote = "assumed " + fps + "fps";
-        if (frameCount > 0 && durationUs > 0) {
-            rateCalc = (int) Math.max(1,
-                    Math.round(((double) frameCount) * 1000000.0 / (double) durationUs));
-            srcNote = rateCalc + "fps";
-        }
-        final int srcFps = rateCalc;
-
-        // one decode to learn the real frame size, which is where rotation
-        // metadata usually disagrees with the container header
-        Bitmap probe = null;
-        try {
-            probe = retriever.getFrameAtTime(0,
-                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
-        } catch (Throwable ignored) {
-        }
-        if (probe == null) {
-            releaseQuietly();
-            return "badapple: " + f.getName() + " has no decodable video track\n";
-        }
-        int fw = probe.getWidth();
-        int fh = probe.getHeight();
-        probe.recycle();
-        if (fw <= 0 || fh <= 0) {
-            releaseQuietly();
-            return "badapple: " + f.getName() + " reported a "
-                    + fw + "x" + fh + " frame\n";
-        }
-
-        final boolean rotate = rot != 0;
-        final Matrix rotM = new Matrix();
-        if (rotate) rotM.postRotate(rot);
 
         // report before attaching. Attaching first puts the overlay over the
         // scroll area before this lands, so the message saying what is playing
         // prints underneath the video and nobody sees it.
         say.say("badapple: " + f.getName() + "\n"
-                + "  " + fw + "x" + fh + (rotate ? " rot " + rot : "")
-                + ", " + fps + "fps shown off a " + srcNote + " source"
-                + ", " + hhmmss(durationUs / 1000000L)
+                + "  " + dims + ", " + hhmmss(durationUs / 1000000L)
                 + (loop ? ", looping" : "") + "\n"
                 + "  'badapple stop', tap it, or press any key\n");
 
-        view = new ImageView(ctx);
-        view.setBackgroundColor(0xFF000000);
-        view.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        view.setClickable(true);
-        view.setFocusable(false);
-        view.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) { stop("stopped"); }
-        });
+        // a FrameLayout holds the pane, so the pane can be centred and letterboxed
+        // inside the slot instead of being stretched or pinned to a corner
+        wrap = new FrameLayout(ctx);
+        wrap.setBackgroundColor(0xFF000000);
+        pane = new Pane(ctx, this);
+        wrap.addView(pane, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT, Gravity.CENTER));
         // same slot the scroll view has: width full, height 0, weight 1. That
         // fills the pane between the tab bar and the input bar and leaves both
         // of them alone.
-        host.addView(view, index, new LinearLayout.LayoutParams(
+        host.addView(wrap, index, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
 
-        // audio is the clock, but a silent file still has to play, so failing
-        // here is not fatal, it just means falling back to the wall clock
-        final long wall0 = SystemClock.elapsedRealtime();
         try {
             player = new MediaPlayer();
             player.setDataSource(f.getAbsolutePath());
             player.setLooping(loop);
-            player.prepare();
-            player.start();
+            player.setOnPreparedListener(new MediaPlayer.OnPreparedListener() {
+                public void onPrepared(MediaPlayer mp) {
+                    if (dead) { releaseQuietly(); return; }
+                    wantPlay = true;
+                    Log.i(TAG, "badapple prepared " + mp.getVideoWidth()
+                            + "x" + mp.getVideoHeight()
+                            + " surfaceLive=" + surfaceLive
+                            + " displaySet=" + displaySet);
+                    sizeToVideo(mp.getVideoWidth(), mp.getVideoHeight());
+                    playIfReady();
+                }
+            });
+            player.setOnVideoSizeChangedListener(
+                    new MediaPlayer.OnVideoSizeChangedListener() {
+                public void onVideoSizeChanged(MediaPlayer mp, int w, int h) {
+                    if (dead) return;
+                    sizeToVideo(w, h);
+                }
+            });
+            player.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
+                public void onCompletion(MediaPlayer mp) {
+                    // only reachable when not looping
+                    stop(null);
+                }
+            });
+            player.setOnErrorListener(new MediaPlayer.OnErrorListener() {
+                public boolean onError(MediaPlayer mp, int what, int extra) {
+                    Log.w(TAG, "badapple player error what=" + what + " extra=" + extra);
+                    stop("playback error " + what + "/" + extra);
+                    return true;
+                }
+            });
+            player.setOnInfoListener(new MediaPlayer.OnInfoListener() {
+                public boolean onInfo(MediaPlayer mp, int what, int extra) {
+                    if (what == MediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START) {
+                        renderedStart = true;
+                    }
+                    return false;
+                }
+            });
+            // async, because prepare() on the UI thread of a headset app is an
+            // ANR waiting to happen
+            player.prepareAsync();
         } catch (Throwable e) {
-            if (player != null) {
-                try { player.release(); } catch (Throwable ignored) { }
-                player = null;
-            }
+            Log.w(TAG, "badapple could not open " + f.getName(), e);
+            stop(null);
+            return "badapple: " + f.getName() + " would not open\n"
+                    + "  " + e.getClass().getSimpleName() + ": " + e.getMessage() + "\n";
         }
-
-        worker = new Thread(new Runnable() {
-            public void run() { pump(rotate, rotM, wall0, durationUs, srcFps); }
-        }, "badapple");
-        worker.setDaemon(true);
-        worker.start();
         return null;
     }
 
     /**
-     * Decode the source in order, keep the frames that belong on screen at the
-     * display rate, and let the audio clock decide when each is shown.
+     * Size the pane to the video's own proportions, centred in the slot, with
+     * black bars where they do not match. Done here rather than by stretching
+     * the pane, because a 4:3 video in a tall terminal pane is otherwise
+     * squashed out of shape.
      */
-    private void pump(final boolean rotate, final Matrix rotM,
-                      final long wall0, final long durationUs, final int srcFps) {
-        final long frameUs = 1000000L / fps;
-        int nextSrc = 0;
-        // rate conversion, in source frames. Adding the display rate once per
-        // source frame and emitting whenever it reaches the source rate keeps
-        // exactly fps frames per second no matter what srcFps is.
-        int acc = 0;
-        long shownUpTo = 0;
-
-        while (!dead) {
-            // 1. decode a short run, keep the ones we will actually show
-            if (queue.size() < QUEUE_MAX) {
-                java.util.List<Bitmap> batch = null;
-                try {
-                    batch = retriever.getFramesAtIndex(nextSrc, RUN);
-                } catch (Throwable ignored) {
-                }
-
-                if (batch == null || batch.isEmpty()) {
-                    if (!loop) { ended = true; break; }
-                    queue.clear();
-                    nextSrc = 0;
-                    acc = 0;
-                    continue;
-                }
-                nextSrc += batch.size();
-
-                for (Bitmap b : batch) {
-                    if (b == null) continue;
-                    acc += fps;
-                    if (acc < srcFps) {
-                        // skipped: free it right away rather than parking 30 of
-                        // these in a queue, which is how this leaked a gigabyte
-                        b.recycle();
-                        continue;
-                    }
-                    acc -= srcFps;
-                    if (rotate) {
-                        // rotate here, into the orientation the view wants, so
-                        // the UI thread has nothing to think about
-                        Bitmap t = Bitmap.createBitmap(
-                                b.getHeight(), b.getWidth(), Bitmap.Config.ARGB_8888);
-                        Canvas c = new Canvas(t);
-                        // clear first. the other order wipes the frame just
-                        // drawn, because SRC replaces rather than blends
-                        c.drawColor(0xFF000000, PorterDuff.Mode.SRC);
-                        c.drawBitmap(b, rotM, null);
-                        b.recycle();
-                        queue.addLast(t);
-                    } else {
-                        queue.addLast(b);
-                    }
-                }
-            }
-
-            // 2. hand over whatever is due
-            long nowUs = clockUs(wall0);
-            if (!queue.isEmpty() && shownUpTo + frameUs <= nowUs) {
-                Bitmap due = queue.pollFirst();
-                shownUpTo += frameUs;
-                postShow(due);
-            } else if (queue.size() >= QUEUE_MAX) {
-                // the decoder is ahead of the clock. give the surplus back, but
-                // do NOT advance the clock for it, or the pacing runs at double
-                // rate and everything after the first drop is early
-                postFree(queue.pollLast());
-            }
-
-            if (!loop && nowUs >= durationUs && queue.isEmpty()) {
-                ended = true;
-                break;
-            }
-
-            try {
-                Thread.sleep(4L);
-            } catch (InterruptedException e) {
-                return;
-            }
-        }
-    }
-
-    private long clockUs(long wall0) {
-        if (player != null) {
-            try {
-                return (long) player.getCurrentPosition() * 1000L;
-            } catch (Throwable ignored) {
-            }
-        }
-        return (SystemClock.elapsedRealtime() - wall0) * 1000L;
-    }
-
-    // ------------------------------------------------------------- ui thread
-
-    private void postShow(final Bitmap bmp) {
+    private void sizeToVideo(final int vw, final int vh) {
+        if (vw <= 0 || vh <= 0) return;
         ui.post(new Runnable() {
             public void run() {
-                if (dead || view == null) {
-                    postFree(bmp);
+                if (dead || wrap == null || pane == null) return;
+                int availW = wrap.getWidth();
+                int availH = wrap.getHeight();
+                if (availW <= 0 || availH <= 0) {
+                    // not laid out yet; try once the layout has happened
+                    wrap.post(new Runnable() {
+                        public void run() { sizeToVideo(vw, vh); }
+                    });
                     return;
                 }
-                view.setImageBitmap(bmp);
-                // the frame this one replaced may still be mid-draw, so it goes
-                // out on a delay rather than being freed under the render thread
-                Bitmap old = view.getTag() instanceof Bitmap ? (Bitmap) view.getTag() : null;
-                if (old != null && old != bmp) postFree(old);
-                view.setTag(bmp);
+                double scale = Math.min((double) availW / (double) vw,
+                                        (double) availH / (double) vh);
+                int w = Math.max(1, (int) Math.round(vw * scale));
+                int h = Math.max(1, (int) Math.round(vh * scale));
+                FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) pane.getLayoutParams();
+                if (lp.width != w || lp.height != h) {
+                    lp.width = w;
+                    lp.height = h;
+                    lp.gravity = Gravity.CENTER;
+                    pane.setLayoutParams(lp);
+                }
             }
         });
     }
 
-    private void postFree(final Bitmap bmp) {
-        if (bmp == null) return;
-        ui.postDelayed(new Runnable() {
-            public void run() {
-                if (!bmp.isRecycled()) bmp.recycle();
-            }
-        }, RETIRE_GRACE_MS);
+    // ------------------------------------------------------ surface lifetime
+
+    /**
+     * A TextureView's SurfaceTexture is neither permanent nor available at a
+     * known moment. Binding a player to a surface that has already been
+     * released is what produces "IllegalArgumentException: the surface has been
+     * released" from inside the renderer, so the display is bound only to a
+     * surface that is valid right then.
+     */
+    void attachSurface(Surface s) {
+        surface = s;
+        surfaceLive = true;
+        displaySet = false;
+        bindSurface();
+        playIfReady();
     }
+
+    void detachSurface() {
+        surfaceLive = false;
+        displaySet = false;
+        surface = null;
+        if (player != null) {
+            try { player.setSurface(null); } catch (Throwable ignored) { }
+        }
+    }
+
+    /**
+     * Hand the player a surface, once, for the current one.
+     *
+     * Split out from attachSurface because the two arrive in either order. The
+     * surface appears when the view is added, often before the player object
+     * exists; the player then takes a moment to prepare. Whichever arrives
+     * second has to finish the job, and doing it in attachSurface alone left the
+     * player with no surface at all, which starts and then draws nothing.
+     */
+    private void bindSurface() {
+        if (displaySet || player == null || !surfaceLive || surface == null) return;
+        try {
+            if (!surface.isValid()) return;
+            player.setSurface(surface);
+            displaySet = true;
+        } catch (Throwable t) {
+            Log.w(TAG, "badapple setSurface refused", t);
+        }
+    }
+
+    /** start, but only when there is both something prepared and somewhere to draw it */
+    private void playIfReady() {
+        bindSurface();
+        if (dead || player == null || !wantPlay || !displaySet) return;
+        try {
+            if (!player.isPlaying()) player.start();
+            Log.i(TAG, "badapple start issued, isPlaying="
+                    + player.isPlaying() + " displaySet=" + displaySet);
+            // a decoder that cannot allocate output buffers plays the audio and
+            // shows nothing, and reports no error of any kind. not hypothetical:
+            // it is what the Qualcomm VP9 path did here, and it looked like a
+            // freeze.
+            ui.postDelayed(new Runnable() {
+                public void run() {
+                    if (dead || renderedStart || warnedNoPicture) return;
+                    warnedNoPicture = true;
+                    say.say("badapple: sound yes, picture no. this decoder is\n"
+                            + "  refusing the video track (VP9 is the usual\n"
+                            + "  culprit on this chip). an H.264 file plays.\n");
+                }
+            }, 4000L);
+        } catch (Throwable t) {
+            Log.w(TAG, "badapple start failed", t);
+            stop("would not start: " + t.getClass().getSimpleName());
+        }
+    }
+
+    // ---------------------------------------------------------- probe / meta
+
+    /**
+     * Duration and dimensions, for the message only. Deliberately the cheap
+     * metadata calls and nothing else: every extra frame decoded here is a
+     * frame decoded for nothing.
+     */
+    private long probeDuration(File f) {
+        MediaMetadataRetriever r = new MediaMetadataRetriever();
+        try {
+            r.setDataSource(f.getAbsolutePath());
+            String s = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION);
+            return s == null ? 0L : Long.parseLong(s);
+        } catch (Throwable t) {
+            return 0L;
+        } finally {
+            try { r.release(); } catch (Throwable ignored) { }
+        }
+    }
+
+    /** @return "WxH" or null if there is no readable video track */
+    private String probeDims(File f) {
+        MediaMetadataRetriever r = new MediaMetadataRetriever();
+        try {
+            r.setDataSource(f.getAbsolutePath());
+            String w = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH);
+            String h = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT);
+            if (w == null || h == null) return null;
+            int iw = Integer.parseInt(w), ih = Integer.parseInt(h);
+            int rot = 0;
+            String rs = r.extractMetadata(
+                    MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION);
+            if (rs != null) rot = Integer.parseInt(rs);
+            // report the shape as it will actually be shown
+            if (rot == 90 || rot == 270) {
+                int t = iw; iw = ih; ih = t;
+            }
+            if (iw <= 0 || ih <= 0) return null;
+            return iw + "x" + ih + (rot == 0 ? "" : " rot " + rot);
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            try { r.release(); } catch (Throwable ignored) { }
+        }
+    }
+
+    // ------------------------------------------------------------- teardown
 
     void stop(String why) {
         if (dead) return;
         dead = true;
 
-        if (worker != null) {
-            worker.interrupt();
-            worker = null;
-        }
-        if (player != null) {
-            try { player.stop(); } catch (Throwable ignored) { }
-            try { player.release(); } catch (Throwable ignored) { }
-            player = null;
-        }
-        releaseQuietly();
-
-        Bitmap b;
-        while ((b = queue.pollFirst()) != null) {
-            try { b.recycle(); } catch (Throwable ignored) { }
-        }
-
+        // tear down the view first, then the player. removing the view destroys
+        // the texture, and a player still bound to it throws on release.
         ui.post(new Runnable() {
             public void run() {
-                if (view != null) {
-                    host.removeView(view);
-                    Bitmap old = view.getTag() instanceof Bitmap ? (Bitmap) view.getTag() : null;
-                    if (old != null && !old.isRecycled()) old.recycle();
-                    view.setTag(null);
-                    view = null;
+                if (wrap != null) {
+                    host.removeView(wrap);
+                    wrap = null;
+                    pane = null;
                 }
-                if (why != null || ended) {
-                    say.say("badapple: " + (why == null ? "done" : why) + "\n");
+                releaseQuietly();
+                surfaceLive = false;
+                displaySet = false;
+                surface = null;
+                wantPlay = false;
+                if (why != null) {
+                    say.say("badapple: " + why + "\n");
                 }
             }
         });
     }
 
     private void releaseQuietly() {
-        if (retriever != null) {
-            try { retriever.release(); } catch (Throwable ignored) { }
-            retriever = null;
-        }
-    }
-
-    private int intMeta(int key, int dflt) {
-        try {
-            String s = retriever.extractMetadata(key);
-            return s == null ? dflt : Integer.parseInt(s);
-        } catch (Throwable e) {
-            return dflt;
-        }
-    }
-
-    private long longMeta(int key, long dflt) {
-        try {
-            String s = retriever.extractMetadata(key);
-            return s == null ? dflt : Long.parseLong(s);
-        } catch (Throwable e) {
-            return dflt;
+        if (player != null) {
+            MediaPlayer p = player;
+            player = null;
+            try { p.setSurface(null); } catch (Throwable ignored) { }
+            try { p.setOnPreparedListener(null); } catch (Throwable ignored) { }
+            try { p.setOnCompletionListener(null); } catch (Throwable ignored) { }
+            try { p.setOnErrorListener(null); } catch (Throwable ignored) { }
+            try { p.setOnInfoListener(null); } catch (Throwable ignored) { }
+            try { p.setOnVideoSizeChangedListener(null); } catch (Throwable ignored) { }
+            try { p.reset(); } catch (Throwable ignored) { }
+            try { p.release(); } catch (Throwable ignored) { }
         }
     }
 

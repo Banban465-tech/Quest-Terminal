@@ -204,6 +204,16 @@ final class Updater {
     /** every top level {...} in an array body, strings still escaped */
     static List<String> objects(String json) {
         List<String> out = new ArrayList<String>();
+        // depth at which a top level element opens: 1 when the body is an array
+        // ([...) 0 when it is a bare object. count brackets as well as braces,
+        // or every element is captured one level too deep and nothing matches.
+        int elemDepth = 0;
+        for (int k = 0; k < json.length(); k++) {
+            char c = json.charAt(k);
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') continue;
+            elemDepth = (c == '[') ? 1 : 0;
+            break;
+        }
         int depth = 0;
         int start = -1;
         boolean inStr = false;
@@ -217,12 +227,12 @@ final class Updater {
                 continue;
             }
             if (ch == '"') { inStr = true; continue; }
-            if (ch == '{') {
-                if (depth == 1) start = i;
+            if (ch == '{' || ch == '[') {
+                if (ch == '{' && depth == elemDepth) start = i;
                 depth++;
-            } else if (ch == '}') {
+            } else if (ch == '}' || ch == ']') {
                 depth--;
-                if (depth == 1 && start >= 0) {
+                if (ch == '}' && depth == elemDepth && start >= 0) {
                     out.add(json.substring(start, i + 1));
                     start = -1;
                 }
@@ -288,10 +298,12 @@ final class Updater {
                 continue;
             }
             if (ch == '"') { inStr = true; continue; }
-            if (ch == '{') { if (depth == 1) start = i; depth++; }
-            else if (ch == '}') {
+            if (ch == '{' || ch == '[') {
+                if (ch == '{' && depth == 1) start = i;
+                depth++;
+            } else if (ch == '}' || ch == ']') {
                 depth--;
-                if (depth == 1 && start >= 0) {
+                if (ch == '}' && depth == 1 && start >= 0) {
                     String a = releaseJson.substring(start, i + 1);
                     if (name.equals(str(a, "name"))) return str(a, "browser_download_url");
                     start = -1;

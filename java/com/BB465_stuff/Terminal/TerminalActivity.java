@@ -33,6 +33,17 @@ import java.util.Locale;
 public class TerminalActivity extends Activity {
 
     private LinearLayout root;
+    /**
+     * root's parent. Nothing is drawn over the whole window any more: the
+     * video overlay goes into root at the scroll view's index instead, so the
+     * input bar and status line stay visible while it plays. A full-window
+     * overlay hid the 'badapple stop' command and the message saying what is
+     * playing.
+     */
+    private android.widget.FrameLayout host;
+    /** index in root that scroll occupies, where an overlay has to go */
+    private int paneIndex = 1;
+    private BadApple apple;
     private LinearLayout tabBar;
     private ScrollView scroll;
     private TextView output;
@@ -121,9 +132,33 @@ String cwd = "";
     };
 
     @Override
+    protected void onPause() {
+        // a decoder thread and an audio player outliving the window is a leak
+        // and a surprise on the next resume, so leaving the app stops it
+        if (apple != null) {
+            apple.stop(null);
+            apple = null;
+        }
+        super.onPause();
+    }
+
+    @Override
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        // any key ends the video, which is what makes it usable in a headset
+        // where there is no pointer and Escape is not a thing
+        if (apple != null && keyCode != KeyEvent.KEYCODE_UNKNOWN) {
+            apple.stop("stopped");
+            apple = null;
+            return true;
+        }
+        return super.onKeyDown(keyCode, event);
+    }
+
+    @Override
     protected void onResume() {
         super.onResume();
         tick.postDelayed(poller, 300);
+        warmAdbSerial();
         // No automatic adb arming: the PC's key is paired over the WIFI TLS
         // transport, adbd tracks authorisation per transport, and a plain TCP
         // 5555 connection from inside the app gets a confirmation prompt a
@@ -163,6 +198,18 @@ String cwd = "";
     public void onRequestPermissionsResult(int requestCode, String[] permissions,
                                            int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == 4601) {
+            boolean ok = grantResults.length > 0;
+            for (int r : grantResults) {
+                if (r != android.content.pm.PackageManager.PERMISSION_GRANTED) ok = false;
+            }
+            append(ok
+                    ? "badapple: granted. type badapple to play it.\n"
+                    : "badapple: denied, so it cannot read the video.\n"
+                      + "  without it there is nothing to show. grant it in\n"
+                      + "  Settings > Apps > Terminal > Permissions.\n");
+            return;
+        }
         if (requestCode == Shell.REQUEST_CODE) {
             // Report the actual verdict instead of blindly retrying.
             boolean granted = grantResults.length > 0
@@ -337,9 +384,10 @@ adbT = new AdbShell(this, device, shCb);
             // to lead with adb as 'the default', which meant a headset with a
             // working Shizuku grant still went down the pairing path first and
             // printed a connect attempt every launch.
-            if (!tryShizukuThenAdb(adbSaved)) {
-                autoConnectAdb(adbSaved);
-            }
+            // Shizuku first. adb is armed either way, so the saved serial is the one
+            // that answers rather than the scanned emulator serial.
+            tryShizukuThenAdb(adbSaved);
+            autoConnectAdb(adbSaved);
         }
     }
 
@@ -368,10 +416,14 @@ adbT = new AdbShell(this, device, shCb);
      * was needs 'adbsetup' once, and the message says so.
      */
     private void autoConnectAdb(String savedDev) {
-        // nothing to do if a transport is already answering. Without this the
-        // startup path and the su-refused path both land here and the
-        // "connecting the adb client to..." line lands in the buffer every time.
-        if (sh != null && sh.isReady()) return;
+        // A working Shizuku is still no reason to leave the adb transport
+        // unarmed. Without an explicit 'adb connect' the adb server only ever
+        // reports whatever it stumbled onto by scanning, which on this device
+        // is the local emulator serial 'emulator-5554' rather than the saved
+        // 127.0.0.1:5555. Connecting is one round trip and idempotent, so it is
+        // done every launch and only the message is toned down when Shizuku
+        // already has the session.
+        final boolean quiet = sh != null && sh.isReady();
         if (!AdbBin.available(this)) {
             append("no adb client in this build, so 'adbsetup' cannot run.\n");
             appendPrompt();
@@ -379,7 +431,11 @@ adbT = new AdbShell(this, device, shCb);
         }
         final String dev = (savedDev != null && savedDev.length() > 0)
                 ? savedDev : loopback(adbDevicePort());
-        append("\nconnecting the adb client to " + dev + "...\n");
+        if (quiet) {
+            append("\nadb transport is kept warm on " + dev + ".\n");
+        } else {
+            append("\nconnecting the adb client to " + dev + "...\n");
+        }
         new Thread(new Runnable() {
             public void run() {
                 AdbBin b = adbBin(dev);
@@ -388,8 +444,20 @@ adbT = new AdbShell(this, device, shCb);
                 post(new Runnable() {
                     public void run() {
                         if (on) {
+                            // only take over as the command transport when
+                            // nothing else is serving. with Shizuku up the
+                            // connect is just there so the saved serial is the
+                            // one that answers, not emulator-5554
+                            if (sh != null && sh.isReady()) {
+                                append("adb: " + dev + " (" + b.devices().trim() + ")\n");
+                                appendPrompt();
+                                return;
+                            }
                             adoptAdb(dev);
                             append("adb transport is up.\n");
+                        } else if (quiet) {
+                            append("adb: not connected yet, run 'adbsetup' to pair.\n");
+                            appendPrompt();
                         } else {
                             append("no adb transport. pair once with 'adbsetup':\n");
                             append("  Settings > Developer > Wireless debugging >\n");
@@ -401,6 +469,46 @@ adbT = new AdbShell(this, device, shCb);
                 });
             }
         }).start();
+    }
+
+    /**
+     * Connect the saved serial, late enough that nothing has restarted the adb
+     * server underneath it.
+     *
+     * Getting this wrong is invisible: an unarmed client still works, because
+     * the adb server finds the headset by scanning and registers it as
+     * 'emulator-5554'. So 'adb -s 127.0.0.1:5555 shell' fails while 'adb
+     * devices' looks perfectly healthy, and the saved device is never used.
+     *
+     * It has to run after codename resolution, because that deliberately
+     * restarts the server to hand it a name, and a restart drops every
+     * transport including one made a moment earlier.
+     */
+    private void warmAdbSerial() {
+        if (!AdbBin.available(this)) return;
+        tick.postDelayed(new Runnable() {
+            public void run() { warmAdbSerialNow(); }
+        }, 4000);
+    }
+
+    private void warmAdbSerialNow() {
+        final String want = pget("adbDev", loopback(adbDevicePort()));
+        Thread t = new Thread(new Runnable() {
+            public void run() {
+                AdbBin b = adbBin(want);
+                b.connect(want);
+                if (b.isOnline()) return;
+                // adbd can still be coming back after a reboot, so one retry
+                // rather than leaving it unarmed until the next launch
+                try { Thread.sleep(2500); } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                if (!isFinishing()) adbBin(want).connect(want);
+            }
+        }, "adb-warm");
+        t.setDaemon(true);
+        t.start();
     }
 
     private String describeSuOnDisk() {
@@ -416,15 +524,15 @@ adbT = new AdbShell(this, device, shCb);
         Shell.watchStale(this.shCb);
         return new Shell.Callback() {
             @Override
-            public void onReady(Shell s) {
-                shCbReady = s;
-                if (sh != null && sh.isReady()) {
-                    // Wireless adb won the startup race and owns the terminal;
-                    // Shizuku stays on standby for 'adbuse' / 'checkshizuku'.
-                    status.setText("shizuku: connected (standby, adb is active)");
-                    return;
-                }
-                sh = s;
+public void onReady(Shell s) {
+                  shCbReady = s;
+                  if (sh != null && sh.isReady()) {
+                      // Wireless adb won the startup race and owns the terminal;
+                      // Shizuku stays on standby for 'adbuse' / 'checkshizuku'.
+                      status.setText("shizuku: connected (standby, adb is active)");
+                      return;
+                  }
+sh = s;
                 status.setText("shizuku: connected (uid 2000 shell)");
                 // ask the headset what it is before the prompt needs to say so
                 loadCodename(s);
@@ -1311,6 +1419,9 @@ adbT = new AdbShell(this, device, shCb);
         scroll.addView(output);
         root.addView(scroll, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        // remember where the scroll view landed, so the video overlay can take
+        // exactly that slot instead of covering the whole window
+        paneIndex = root.indexOfChild(scroll);
 
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
@@ -1428,7 +1539,264 @@ adbT = new AdbShell(this, device, shCb);
         status.setPadding(dp(8), dp(2), dp(8), dp(2));
         root.addView(status);
 
-        setContentView(root);
+        // host exists so a full-screen overlay can sit on top of the whole app
+        // without disturbing the layout above. root is unchanged inside it, so
+        // the vertical LinearLayout still measures the way it always has.
+        host = new android.widget.FrameLayout(this);
+        host.addView(root, new android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT));
+
+        setContentView(host);
+    }
+
+    // ---------------------------------------------------------- bad apple
+
+    /**
+     * Find the video without being told where it is. A person dropping a file
+     * in Downloads and typing 'badapple' is the whole interaction, so the
+     * common places get checked before giving up and asking.
+     */
+    private java.io.File findAppleVideo(String named) {
+        java.util.List<java.io.File> tries = new java.util.ArrayList<java.io.File>();
+        if (named != null && named.length() > 0) {
+            tries.add(new java.io.File(named));
+        }
+        String[] dirs = {
+            System.getenv("BADAPPLE_VIDEO"),
+            "/sdcard/Download",
+            "/sdcard/Downloads",
+            "/storage/emulated/0/Download",
+            "/storage/emulated/0/Downloads",
+            "/data/local/tmp",
+            System.getProperty("user.home"),
+        };
+        for (String d : dirs) {
+            if (d == null || d.length() == 0) continue;
+            java.io.File dir = new java.io.File(d);
+            java.io.File[] kids = dir.listFiles();
+            if (kids == null) continue;
+            for (java.io.File f : kids) {
+                String n = f.getName().toLowerCase(java.util.Locale.US);
+                if (n.contains("bad apple") || n.contains("badapple")
+                        || n.contains("bad_apple")) {
+                    if (isVideo(f)) return f;
+                }
+            }
+        }
+        // no name match, so take the first video we can see
+        for (String d : dirs) {
+            if (d == null || d.length() == 0) continue;
+            java.io.File[] kids = new java.io.File(d).listFiles();
+            if (kids == null) continue;
+            for (java.io.File f : kids) {
+                if (isVideo(f)) return f;
+            }
+        }
+        return null;
+    }
+
+    private boolean isVideo(java.io.File f) {
+        if (!f.isFile() || f.length() < 1024) return false;
+        String n = f.getName().toLowerCase(java.util.Locale.US);
+        return n.endsWith(".mp4") || n.endsWith(".mkv") || n.endsWith(".webm")
+                || n.endsWith(".mov") || n.endsWith(".m4v") || n.endsWith(".3gp");
+    }
+
+    private void doBadApple(String arg) {
+        String[] a = arg == null ? new String[0] : arg.trim().split("\\s+");
+        String named = "";
+        int fps = 12;
+        boolean loop = true;
+
+        for (String w : a) {
+            if (w.length() == 0) continue;
+            if (w.startsWith("fps=")) {
+                try {
+                    fps = Math.max(1, Math.min(60, Integer.parseInt(w.substring(4))));
+                } catch (NumberFormatException e) {
+                    append("badapple: fps= wants a number, not '" + w.substring(4) + "'\n");
+                    return;
+                }
+            } else if (w.equals("once")) {
+                loop = false;
+            } else if (w.equals("loop")) {
+                loop = true;
+            } else if (w.equals("stop")) {
+                if (apple != null) {
+                    apple.stop("stopped");
+                    apple = null;
+                    append("badapple: stopped\n");
+                } else {
+                    append("badapple: not playing\n");
+                }
+                return;
+            } else if (w.equals("url")) {
+                append("badapple url <address>\n"
+                        + "  fetches that address into the app cache and plays it.\n\n"
+                        + "  default is " + AppleSource.DEFAULT_URL + "\n");
+                return;
+            } else if (w.equals("help")) {
+                append(appleHelp());
+                return;
+            } else {
+                named = w;
+            }
+        }
+
+        if (apple != null) {
+            apple.stop(null);
+            apple = null;
+        }
+
+        // a bare http(s) argument means "fetch this", which is how a headset that has
+        // never seen the file gets one without an adb push per device
+        if (named.startsWith("http://") || named.startsWith("https://")) {
+            grabApple(named, fps, loop);
+            return;
+        }
+
+        // A cached copy is app-private, so it needs no storage permission and
+        // works on a fresh headset that has never had anything pushed to it.
+        // Only fall back to shared storage, which does need the grant, when
+        // there is no cache and nothing was named.
+        java.io.File f = AppleSource.cached(this);
+        boolean haveCache = f.isFile() && f.length() > 1024;
+
+        if (!haveCache && named.length() == 0 && !hasMediaRead()) {
+            append("badapple: not on this headset yet, fetching it.\n"
+                    + "  first run is ~12MB, then it is cached.\n");
+            grabApple(AppleSource.DEFAULT_URL, fps, loop);
+            return;
+        }
+
+        if (!haveCache && !hasMediaRead()) {
+            requestMediaRead();
+            append("badapple: no cached copy, and reading video needs permission.\n"
+                    + "  asked for it. accept it, or just type badapple again to\n"
+                    + "  download instead.\n");
+            return;
+        }
+
+        if (!haveCache && named.length() == 0 && System.getenv("BADAPPLE_VIDEO") == null) {
+            java.io.File found = findAppleVideo("");
+            if (found != null) f = found;
+        } else if (named.length() > 0) {
+            java.io.File direct = new java.io.File(named);
+            if (direct.isFile()) f = direct;
+        }
+
+        if (!f.isFile() || f.length() < 1024) {
+            grabApple(AppleSource.DEFAULT_URL, fps, loop);
+            return;
+        }
+
+        startApple(f, fps, loop);
+    }
+
+    /** pull the video down on a worker, then start playing it */
+    private void grabApple(final String url, final int fps, final boolean loop) {
+        append("badapple: downloading, this is 12MB or so.\n");
+        final long t0 = System.currentTimeMillis();
+        Thread th = new Thread(new Runnable() {
+            public void run() {
+                final long[] lastReport = {0};
+                final String err = AppleSource.fetch(TerminalActivity.this, url,
+                        new AppleSource.Progress() {
+                            public void bytes(long got, long total) {
+                                // only every megabyte, or the scrollback fills
+                                // with progress lines on a fast link
+                                if (got - lastReport[0] < 1048576L) return;
+                                lastReport[0] = got;
+                                final String line = "badapple: "
+                                        + (got / 1048576L) + "MB"
+                                        + (total > 0 ? " of " + (total / 1048576L) + "MB" : "")
+                                        + "\n";
+                                UI.post(new Runnable() {
+                                    public void run() { append(line); }
+                                });
+                            }
+                        });
+                UI.post(new Runnable() {
+                    public void run() {
+                        if (err != null) {
+                            append(err
+                                    + "  no cached copy, so there is nothing to play.\n\n");
+                            append(appleHelp());
+                            return;
+                        }
+                        append("badapple: got it in "
+                                + ((System.currentTimeMillis() - t0) / 1000L) + "s\n");
+                        startApple(AppleSource.cached(TerminalActivity.this), fps, loop);
+                    }
+                });
+            }
+        }, "badapple-fetch");
+        th.setDaemon(true);
+        th.start();
+    }
+
+    /** start playback on an already-resolved file */
+    private void startApple(java.io.File f, int fps, boolean loop) {
+        if (apple != null) {
+            apple.stop(null);
+            apple = null;
+        }
+        final BadApple[] slot = new BadApple[1];
+        BadApple ba = new BadApple(this, root, paneIndex, new BadApple.Say() {
+            public void say(String s) {
+                append(s);
+                // a callback can fire after the caller already started another
+                // one, so only clear the field if it is still ours
+                if (apple == slot[0]) apple = null;
+            }
+        }, f.getAbsolutePath(), fps, loop);
+        slot[0] = ba;
+        apple = ba;
+        String err = ba.start();
+        if (err != null) {
+            apple = null;
+            append(err);
+        }
+    }
+
+    private boolean hasMediaRead() {
+        // READ_EXTERNAL_STORAGE is the whole story up to API 32, after that
+        // video moved to READ_MEDIA_VIDEO
+        String p = android.os.Build.VERSION.SDK_INT >= 33
+                ? "android.permission.READ_MEDIA_VIDEO"
+                : "android.permission.READ_EXTERNAL_STORAGE";
+        return checkSelfPermission(p) == android.content.pm.PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void requestMediaRead() {
+        final String[] want = android.os.Build.VERSION.SDK_INT >= 33
+                ? new String[]{"android.permission.READ_MEDIA_VIDEO",
+                               "android.permission.READ_MEDIA_IMAGES"}
+                : new String[]{"android.permission.READ_EXTERNAL_STORAGE"};
+        try {
+            requestPermissions(want, 4601);
+        } catch (Throwable e) {
+            append("badapple: could not ask for permission: "
+                    + e.getClass().getSimpleName() + "\n");
+        }
+    }
+
+    private String appleHelp() {
+        return "hehe\n\n"
+            + "badapple [file|url] [fps=N] [once|loop]\n"
+            + "  also reachable as: termdev badapple [same args]\n"
+            + "  plays it over the app in its own view, so the frames never\n"
+            + "  land in the scrollback and the terminal stays usable\n\n"
+            + "  badapple                play it, downloading first if needed\n"
+            + "  badapple once fps=12    straight through, no loop\n"
+            + "  badapple <url>          fetch that url instead of the default\n"
+            + "  badapple <file>         play a file already on the headset\n"
+            + "  badapple stop           stop it early\n\n"
+            + "  on a headset that has never seen it, the first run pulls about\n"
+            + "  12MB and caches it in the app. after that it is instant and\n"
+            + "  works with no permission granted and no network.\n\n"
+            + "  tap the video or press any key to stop it\n";
     }
 
     private int dp(int v) {
@@ -1591,6 +1959,7 @@ adbT = new AdbShell(this, device, shCb);
             || verb.equals("pkg") || verb.equals("run") || verb.equals("su")
             || verb.equals("update") || verb.equals("updates") || verb.equals("credits")
             || verb.equals("disableupdates") || verb.equals("enableupdates")
+            || verb.equals("badapple") || verb.equals("apple")
             || verb.equals("pwshfile") || verb.equals("pwshdemo");
     }
 
@@ -2553,6 +2922,18 @@ adbT = new AdbShell(this, device, shCb);
             return;
         }
 
+        if (sub.equals("badapple") || sub.equals("apple")) {
+            // pass the rest through, so 'termdev badapple once fps=12' means
+            // exactly what 'badapple once fps=12' means
+            StringBuilder rest = new StringBuilder();
+            for (int i = 1; i < a.length; i++) {
+                if (rest.length() > 0) rest.append(' ');
+                rest.append(a[i]);
+            }
+            doBadApple(rest.toString());
+            return;
+        }
+
         if (sub.equals("keys")) {
             append(AdbBin.keyReport());
             append("\nthis is app-private storage, so it survives a restart and a\n"
@@ -3042,6 +3423,7 @@ adbT = new AdbShell(this, device, shCb);
         if (verb.equals("adbtcpip") || verb.equals("adbwireless")) { doAdbTcpip(arg, s); return true; }
         if (verb.equals("adbroot")) { doAdbRoot(s); return true; }
         if (verb.equals("termdev")) { doTermDev(arg, s); return true; }
+        if (verb.equals("badapple") || verb.equals("apple")) { doBadApple(arg); return true; }
         if (verb.equals("adbkillserver")) { doAdbServer(s, true); return true; }
         if (verb.equals("adbstartserver")) { doAdbServer(s, false); return true; }
         if (verb.equals("adbdev")) { doAdbDev(s); return true; }
@@ -4055,6 +4437,7 @@ final String[] keys = {
               + "  adbstartserver            adb start-server\n"
               + "  adbkillserver             adb kill-server\n"
 + "  termdev                  info | log | savelog | server | selftest\n"
+              + "  badapple                 play a video over the app, not in the scrollback\n"
               + "  adbuse                    go back to Shizuku\n"
              + "  su [command]              root via the app's own su\n"
              + "  askforsu                  same, but waits 60s for the prompt\n"

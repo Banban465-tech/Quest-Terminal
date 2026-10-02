@@ -5,6 +5,16 @@
     android:versionName="1.2.5">
 
     <uses-permission android:name="android.permission.INTERNET" />
+  
+      <!-- badapple reads the video off shared storage. Android 13 split this
+           out of READ_EXTERNAL_STORAGE, and on 14 READ_EXTERNAL_STORAGE no
+           longer grants video at all, so a 34-target app asking only for the
+           old one silently sees an empty Downloads. READ_MEDIA_IMAGES and
+           VIDEO are both asked for so the file can be found under either. -->
+      <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+      <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+      <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+          android:maxSdkVersion="32" />
 
     <!-- Shizuku. ByteZuku and other forks key off the original namespace,
          so that is the one that must be present for the app to appear in the

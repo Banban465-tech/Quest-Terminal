@@ -1917,10 +1917,12 @@ sh = s;
              + "  Kotlin- / gamble_now\n"
              + "\n"
              + "badapple:\n"
-             + "  ZUN / Team Shanghai Alice    original 'Bad Apple!!' (Touhou 4)\n"
-             + "  Masayoshi Minoshima          arrangement (Alstroemeria Records)\n"
+             + "  ZUN / Team Shanghai Alice    original 'Bad Apple!!' (Touhou 4: Lotus Land Story)\n"
+             + "  Masayoshi Minoshima          arrangement (Alstroemeria Records, Lovelight)\n"
              + "  nomico                       vocals\n"
-             + "  Anira                        the shadow-art PV\n"
+             + "  Anira (\u3042\u306b\u3089)   the shadow-art PV\n"
+             + "  kasidid2                     YouTube upload: watch?v=FtutLA63Cp8\n"
+             + "                               (niconico original sm8628149)\n"
              + "\n");
     }
 

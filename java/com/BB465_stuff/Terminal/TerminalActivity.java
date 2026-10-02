@@ -1914,7 +1914,14 @@ sh = s;
         append("credits to:\n"
              + "  FreeXR      https://discord.gg/ABCXxDyqrH\n"
              + "  yanno1222 / .networth_\n"
-             + "  Kotlin- / gamble_now\n\n");
+             + "  Kotlin- / gamble_now\n"
+             + "\n"
+             + "badapple:\n"
+             + "  ZUN / Team Shanghai Alice    original 'Bad Apple!!' (Touhou 4)\n"
+             + "  Masayoshi Minoshima          arrangement (Alstroemeria Records)\n"
+             + "  nomico                       vocals\n"
+             + "  Anira                        the shadow-art PV\n"
+             + "\n");
     }
 
     private void newSession() {

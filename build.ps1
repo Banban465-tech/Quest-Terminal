@@ -62,6 +62,50 @@ $jarExe   = Join-Path $javabin "jar.exe"
 
 function Step($m) { Write-Host "`n=== $m ===" -ForegroundColor Cyan }
 
+# Run a native tool and judge it by exit code only.
+#
+# In Windows PowerShell 5.1, `2>&1` on a native command turns that command's
+# stderr into ErrorRecords, and $ErrorActionPreference = "Stop" then makes them
+# terminating. The JDK behind apksigner prints harmless warnings on stderr
+# ("WARNING: A restricted method in java.lang.System has been called"), so
+# redirecting apksigner's output aborted the build with exit 1 while leaving a
+# correctly signed terminal.apk behind and reporting a failure that did not
+# happen. Errors are reported by the exit code check after every call, so the
+# preference is only relaxed for the duration of the call here.
+#
+# Returns @{ Code; Lines }, where Lines is the merged output as plain strings
+# with the known JDK noise filtered out. It prints nothing itself: a caller
+# that needs to inspect the output has to be able to see it, and Write-Host
+# goes to the host, not the pipeline.
+function RunNative($exe, [string[]]$NativeArgs, [string[]]$Noise = @()) {
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $out = & $exe @NativeArgs 2>&1
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($line in @($out)) {
+        # a redirected stderr line arrives as an ErrorRecord, and stringifying
+        # one yields "System.Management.Automation.RemoteException" instead of
+        # the text apksigner actually wrote
+        if ($line -is [System.Management.Automation.ErrorRecord]) {
+            $text = $line.Exception.Message
+        } else {
+            $text = "$line"
+        }
+        $skip = $false
+        foreach ($pattern in $Noise) {
+            if ($text -match $pattern) { $skip = $true; break }
+        }
+        if (-not $skip) { [void]$lines.Add($text) }
+    }
+    return @{ Code = $code; Lines = $lines.ToArray() }
+}
+
 Step "clean"
 Get-ChildItem $BUILD -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 # Start from a clean output tree. d8 does not clear stale files from its
@@ -176,16 +220,25 @@ $KEYALIAS = Need "KEY_ALIAS"     "the key alias inside it"
 if (-not (Test-Path $KEYSTORE)) { throw "KEYSTORE does not exist: $KEYSTORE" }
 
 Step "apksigner"
-& "$BT\apksigner.bat" sign `
-    --ks $KEYSTORE --ks-pass "pass:$KSPASS" --key-pass "pass:$KSPASS" `
-    --ks-key-alias $KEYALIAS `
-    --out "$BUILD\terminal.apk" "$BUILD\aligned.apk" 2>&1 |
-    Where-Object { $_ -notmatch "restricted method|loadLibrary|native-access" }
-if ($LASTEXITCODE -ne 0) { throw "apksigner failed" }
+$jdkNoise = @("restricted method", "loadLibrary", "native-access", "Restricted methods will be blocked")
+$sign = RunNative "$BT\apksigner.bat" @(
+    "sign",
+    "--ks", $KEYSTORE, "--ks-pass", "pass:$KSPASS", "--key-pass", "pass:$KSPASS",
+    "--ks-key-alias", $KEYALIAS,
+    "--out", "$BUILD\terminal.apk", "$BUILD\aligned.apk"
+) $jdkNoise
+if ($sign.Code -ne 0) { throw "apksigner failed with exit code $($sign.Code)" }
+if (-not (Test-Path "$BUILD\terminal.apk")) { throw "apksigner reported success but terminal.apk is missing" }
 
 Step "verify"
-& "$BT\apksigner.bat" verify --print-certs "$BUILD\terminal.apk" 2>&1 |
-    Select-String "Signer #1 certificate DN" | ForEach-Object { "  " + $_.ToString().Trim() }
+$verify = RunNative "$BT\apksigner.bat" @("verify", "--print-certs", "$BUILD\terminal.apk") $jdkNoise
+if ($verify.Code -ne 0) { throw "apksigner verify failed with exit code $($verify.Code)" }
+$dn = @($verify.Lines | Where-Object { $_ -match "Signer #1 certificate DN" })
+if ($dn.Count -eq 0) {
+    # nothing matched, so do not print an empty success line and call it done
+    throw "apksigner verify produced no signer certificate, so the APK is not signed as expected"
+}
+foreach ($d in $dn) { Write-Host "  $d" }
 
 $apk = Get-Item "$BUILD\terminal.apk"
 Write-Host "`nOK  $($apk.FullName)  $($apk.Length) bytes" -ForegroundColor Green

@@ -27,23 +27,26 @@ import java.io.File;
  * re-layout of the text view on every one of them. So the pictures get their
  * own view inside the terminal pane and the scrollback keeps what it had.
  *
- * Frames are pulled by timestamp, straight from the audio clock, never by
- * walking a frame index. Two earlier attempts got the speed wrong in opposite
- * directions and both were wrong for the same underlying reason, which is that
- * a frame index and a playing sound are different clocks:
+ * Frames are decoded sequentially and converted to the display rate, never
+ * seeked to by timestamp. Both of the obvious alternatives are wrong here, in
+ * opposite directions:
  *
- *   - one frame per tick plays a 30fps source at 2.5x with the music stuck in
- *     real time, because 30 source frames per second go past 12 times;
- *   - deriving a stride from the container's frame count is only as good as
- *     that metadata, and it guessed wrong the other way, slow.
+ *   - one seek per displayed frame, asking for the nearest sync frame, is
+ *     fast but returns the SAME frame for every tick between keyframes, which
+ *     is not slow playback, it is a freeze. This file has sparse keyframes.
+ *   - asking for the exact frame with OPTION_CLOSEST decodes forward from the
+ *     previous keyframe on every call, so twelve requests a second repeat most
+ *     of every group of pictures and it plays at a third of speed.
  *
- * Asking for the frame that belongs to the audio that is playing right now
- * cannot be wrong about speed at all. What it costs is exactness: the decoder
- * returns the nearest keyframe rather than decoding forward to land exactly on
- * the timestamp, which is the difference between a fast plain seek and the
- * version that played at a third of speed because every call walked and decoded
- * a whole group of pictures. Keyframes in this source are frequent enough that
- * the quantisation is invisible.
+ * So: walk the frames in order, decode a short run at a time, and keep one out
+ * of every srcFps/fps. Because the walk is sequential the decoder never has to
+ * seek, and because the keeps are counted against the source rate rather than
+ * assumed, the speed is right whether the source is 24, 25, 30 or 60fps.
+ *
+ * Frames are picked by an accumulator rather than a fixed stride, because the
+ * ratio is usually not a whole number. 30fps shown at 12fps is two and a half
+ * source frames per displayed frame, and a stride of 3 would drift 20% by the
+ * end of the video.
  *
  * Bitmaps belong to the UI thread. The worker never frees one, because the
  * render thread can still be drawing a frame that setImageBitmap has already
@@ -61,6 +64,17 @@ class BadApple {
      * started before the swap.
      */
     private static final int RETIRE_GRACE_MS = 400;
+
+    /**
+     * Source frames decoded per pass. Sequential, so the decoder never seeks,
+     * but each one is a real Bitmap, so this is not free. Six at 640x480 is
+     * about 7MB held briefly, which is what it takes to be able to keep one in
+     * three and still not stall the worker.
+     */
+    private static final int RUN = 6;
+
+    /** how many ready-to-show frames may sit ahead of the clock */
+    private static final int QUEUE_MAX = 6;
 
     private final Context ctx;
     /**
@@ -84,6 +98,10 @@ class BadApple {
     private Thread worker;
     private volatile boolean dead;
     private volatile boolean ended;
+
+    /** ready-to-show frames waiting for their moment. worker thread only. */
+    private final java.util.ArrayDeque<Bitmap> queue =
+            new java.util.ArrayDeque<Bitmap>();
 
     BadApple(Context ctx, ViewGroup host, int index, Say say,
              String path, int fps, boolean loop) {
@@ -114,8 +132,20 @@ class BadApple {
                     + "  " + e.getClass().getSimpleName() + ": " + e.getMessage() + "\n";
         }
 
-        long durationUs = longMeta(MediaMetadataRetriever.METADATA_KEY_DURATION, 0L);
+        final long durationUs = longMeta(MediaMetadataRetriever.METADATA_KEY_DURATION, 0L);
         int rot = intMeta(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION, 0);
+        // how many source frames there are, which is what gives the real source
+        // rate. without it the rate conversion has to assume, and assuming is
+        // how the speed ended up wrong twice already.
+        int frameCount = intMeta(MediaMetadataRetriever.METADATA_KEY_VIDEO_FRAME_COUNT, 0);
+        int rateCalc = fps;
+        String srcNote = "assumed " + fps + "fps";
+        if (frameCount > 0 && durationUs > 0) {
+            rateCalc = (int) Math.max(1,
+                    Math.round(((double) frameCount) * 1000000.0 / (double) durationUs));
+            srcNote = rateCalc + "fps";
+        }
+        final int srcFps = rateCalc;
 
         // one decode to learn the real frame size, which is where rotation
         // metadata usually disagrees with the container header
@@ -147,8 +177,8 @@ class BadApple {
         // prints underneath the video and nobody sees it.
         say.say("badapple: " + f.getName() + "\n"
                 + "  " + fw + "x" + fh + (rotate ? " rot " + rot : "")
-                + ", " + fps + "fps off the audio clock, "
-                + hhmmss(durationUs / 1000000L)
+                + ", " + fps + "fps shown off a " + srcNote + " source"
+                + ", " + hhmmss(durationUs / 1000000L)
                 + (loop ? ", looping" : "") + "\n"
                 + "  'badapple stop', tap it, or press any key\n");
 
@@ -183,7 +213,7 @@ class BadApple {
         }
 
         worker = new Thread(new Runnable() {
-            public void run() { pump(rotate, rotM, wall0, durationUs); }
+            public void run() { pump(rotate, rotM, wall0, durationUs, srcFps); }
         }, "badapple");
         worker.setDaemon(true);
         worker.start();
@@ -191,56 +221,85 @@ class BadApple {
     }
 
     /**
-     * Show the frame that belongs to the audio playing right now.
+     * Decode the source in order, keep the frames that belong on screen at the
+     * display rate, and let the audio clock decide when each is shown.
      */
     private void pump(final boolean rotate, final Matrix rotM,
-                      final long wall0, final long durationUs) {
+                      final long wall0, final long durationUs, final int srcFps) {
         final long frameUs = 1000000L / fps;
-        long lastSlot = -1;
+        int nextSrc = 0;
+        // rate conversion, in source frames. Adding the display rate once per
+        // source frame and emitting whenever it reaches the source rate keeps
+        // exactly fps frames per second no matter what srcFps is.
+        int acc = 0;
+        long shownUpTo = 0;
 
         while (!dead) {
-            long nowUs = clockUs(wall0);
-            long slot = (nowUs / frameUs) * frameUs;
-
-            if (slot != lastSlot) {
-                lastSlot = slot;
-                Bitmap got = null;
+            // 1. decode a short run, keep the ones we will actually show
+            if (queue.size() < QUEUE_MAX) {
+                java.util.List<Bitmap> batch = null;
                 try {
-                    got = retriever.getFrameAtTime(
-                            slot, MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
+                    batch = retriever.getFramesAtIndex(nextSrc, RUN);
                 } catch (Throwable ignored) {
                 }
 
-                if (got == null) {
+                if (batch == null || batch.isEmpty()) {
                     if (!loop) { ended = true; break; }
-                    lastSlot = -1;
-                    try {
-                        Thread.sleep(60L);
-                    } catch (InterruptedException e) {
-                        return;
-                    }
+                    queue.clear();
+                    nextSrc = 0;
+                    acc = 0;
                     continue;
                 }
+                nextSrc += batch.size();
 
-                if (rotate) {
-                    Bitmap t = Bitmap.createBitmap(
-                            got.getHeight(), got.getWidth(), Bitmap.Config.ARGB_8888);
-                    Canvas c = new Canvas(t);
-                    // clear first. the other order wipes the frame just drawn,
-                    // because SRC replaces the destination rather than blending
-                    c.drawColor(0xFF000000, PorterDuff.Mode.SRC);
-                    c.drawBitmap(got, rotM, null);
-                    got.recycle();
-                    postShow(t);
-                } else {
-                    postShow(got);
+                for (Bitmap b : batch) {
+                    if (b == null) continue;
+                    acc += fps;
+                    if (acc < srcFps) {
+                        // skipped: free it right away rather than parking 30 of
+                        // these in a queue, which is how this leaked a gigabyte
+                        b.recycle();
+                        continue;
+                    }
+                    acc -= srcFps;
+                    if (rotate) {
+                        // rotate here, into the orientation the view wants, so
+                        // the UI thread has nothing to think about
+                        Bitmap t = Bitmap.createBitmap(
+                                b.getHeight(), b.getWidth(), Bitmap.Config.ARGB_8888);
+                        Canvas c = new Canvas(t);
+                        // clear first. the other order wipes the frame just
+                        // drawn, because SRC replaces rather than blends
+                        c.drawColor(0xFF000000, PorterDuff.Mode.SRC);
+                        c.drawBitmap(b, rotM, null);
+                        b.recycle();
+                        queue.addLast(t);
+                    } else {
+                        queue.addLast(b);
+                    }
                 }
             }
 
-            if (!loop && nowUs >= durationUs) { ended = true; break; }
+            // 2. hand over whatever is due
+            long nowUs = clockUs(wall0);
+            if (!queue.isEmpty() && shownUpTo + frameUs <= nowUs) {
+                Bitmap due = queue.pollFirst();
+                shownUpTo += frameUs;
+                postShow(due);
+            } else if (queue.size() >= QUEUE_MAX) {
+                // the decoder is ahead of the clock. give the surplus back, but
+                // do NOT advance the clock for it, or the pacing runs at double
+                // rate and everything after the first drop is early
+                postFree(queue.pollLast());
+            }
+
+            if (!loop && nowUs >= durationUs && queue.isEmpty()) {
+                ended = true;
+                break;
+            }
 
             try {
-                Thread.sleep(6L);
+                Thread.sleep(4L);
             } catch (InterruptedException e) {
                 return;
             }
@@ -299,6 +358,11 @@ class BadApple {
             player = null;
         }
         releaseQuietly();
+
+        Bitmap b;
+        while ((b = queue.pollFirst()) != null) {
+            try { b.recycle(); } catch (Throwable ignored) { }
+        }
 
         ui.post(new Runnable() {
             public void run() {

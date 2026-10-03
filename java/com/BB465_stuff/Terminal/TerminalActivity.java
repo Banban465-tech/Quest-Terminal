@@ -1969,7 +1969,8 @@ sh = s;
             || verb.equals("update") || verb.equals("updates") || verb.equals("credits")
             || verb.equals("disableupdates") || verb.equals("enableupdates")
             || verb.equals("badapple") || verb.equals("apple")
-            || verb.equals("pwshfile") || verb.equals("pwshdemo");
+            || verb.equals("pwshfile") || verb.equals("pwshdemo")
+            || verb.equals("curl");
     }
 
     /**
@@ -2030,6 +2031,12 @@ sh = s;
         + "  openurl <url>             am start VIEW\n"
         + "  tel <number>              am start CALL\n"
         + "  sms <number> <body>       am start SENDTO\n\n"
+
+        + "-- network ----------------------------------------------------\n"
+        + "  curl <url>                HTTP(S) in the app; real TLS, unlike the\n"
+        + "                            device's wget. no shell needed to fetch.\n"
+        + "                            -o save, -I headers, -sSL quiet redirects.\n"
+        + "                            'curl -h' for the whole flag list\n\n"
 
         + "-- diagnostics ------------------------------------------------\n"
         + "  info                      model, codename, uid, selinux, root\n"
@@ -2210,6 +2217,15 @@ sh = s;
         }
     }
 
+    /** versionCode, read live too, so nothing pins a stale number */
+    private int myVersionCode() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionCode;
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
     /**
      * Update menu: current version, check, check-on-startup. Nothing is installed
      * from here without a tap on the install row, and the row only appears once
@@ -2286,8 +2302,8 @@ sh = s;
                 try {
                     r = Updater.latest();
                     if (r == null) msg = "no releases with an apk yet";
-                    else if (!Updater.newerThan(r, mine)) msg = "up to date, " + r.label() + " is the newest";
-                    else msg = r.label() + " is available";
+                    else if (!Updater.newerThan(r, mine)) msg = "you are on v" + mine + ", " + r.label() + " is the newest";
+                    else msg = "you are on v" + mine + ", " + r.label() + " is available";
                 } catch (Throwable t) {
                     msg = "check failed: " + t.getMessage();
                 }
@@ -2540,8 +2556,14 @@ sh = s;
         sh.psStart(new Shell.Raw() {
             public void got(String o) {
                 s.busy = false;
-                if (o == null || !o.startsWith("BB|")) {
-                    append((o == null ? "pwsh start failed" : o) + "\n");
+                // A live session is a BB| version probe. "ok" is accepted too
+                // so a transport that starts pwsh but does not probe still
+                // works instead of printing "ok" and leaving the tab in sh.
+                String t = o == null ? "" : o.trim();
+                boolean live = t.startsWith("BB|") || t.equals("ok")
+                        || t.equals("already running");
+                if (!live) {
+                    append((t.length() == 0 ? "pwsh start failed" : t) + "\n");
                     render();
                     return;
                 }
@@ -2550,7 +2572,7 @@ sh = s;
                 s.title = "pwsh";
                 s.buf.replace(0, s.buf.length(), "");
                 if (pon("psBanner", true)) {
-                    s.buf.append(psBanner(o));
+                    s.buf.append(psBanner(t.startsWith("BB|") ? t : "BB|unknown|Unknown||"));
                 }
                 render();
                 appendPrompt();
@@ -2610,6 +2632,194 @@ sh = s;
                 appendPrompt();
             }
         });
+    }
+
+    // ------------------------------------------------------------------ curl
+
+    /**
+     * curl, served from the app process. It needs no shell to run at all:
+     * Java carries the TLS stack, which is the entire reason this exists (the
+     * device has no curl and its wget does not check certificates). A shell is
+     * only consulted to put a saved file somewhere the app itself cannot
+     * write, which on this target is anything on /sdcard outside Android/data.
+     */
+    private void doCurl(String arg, Session s) {
+        final String[] args = Curl.split(arg == null ? "" : arg);
+        final Curl.Opts o;
+        try {
+            o = Curl.parse(args, s.cwd);
+        } catch (Curl.Weird w) {
+            append("curl: " + w.getMessage() + "\n  'curl -h' for usage\n");
+            return;
+        }
+        if (o.help || args.length == 0) { append(Curl.help()); return; }
+        if (o.version) { append("curl 8.7.1 (QuestTerminal; java.net)\n"); return; }
+
+        // -O names the file from the url, -o names it explicitly, neither
+        // means "print the body here"
+        final String outPath;
+        if (o.output != null) outPath = curlPath(o.output, s);
+        else if (o.remoteName) outPath = curlPath(curlName(o.urls), s);
+        else outPath = null;
+
+        if (!o.silent) {
+            append("curl: " + (o.head ? "HEAD " : "")
+                    + (o.urls.isEmpty() ? "?" : o.urls.get(0))
+                    + " -> " + (outPath == null ? "the screen" : outPath) + "\n");
+        }
+
+        final Curl.Say say = new Curl.Say() {
+            public void say(String t) { append(t); }
+        };
+        s.busy = true;
+        Thread th = new Thread(new Runnable() {
+            public void run() {
+                java.io.File tmp = null;
+                try {
+                    if (outPath == null) {
+                        Curl.Result r = Curl.request(o, say, null);
+                        reportCurl(r, null, o);
+                    } else {
+                        tmp = java.io.File.createTempFile("curl-", ".part", getCacheDir());
+                        Curl.Result r = Curl.request(o, say, tmp);
+                        String bad = placeCurl(tmp, outPath);
+                        if (bad != null) append("curl: " + bad + "\n");
+                        else reportCurl(r, outPath, o);
+                    }
+                } catch (Curl.Weird w) {
+                    append("curl: " + w.getMessage() + "\n");
+                } catch (Exception e) {
+                    append("curl: " + e.getClass().getSimpleName()
+                            + (e.getMessage() == null ? "" : ": " + e.getMessage()) + "\n");
+                } finally {
+                    if (tmp != null) tmp.delete();
+                    final Session cur = sessions.isEmpty() ? null : sessions.get(current);
+                    if (cur != null) cur.busy = false;
+                    appendPrompt();
+                }
+            }
+        }, "curl");
+        th.setDaemon(true);
+        th.start();
+    }
+
+    private void reportCurl(Curl.Result r, String outPath, Curl.Opts o) {
+        if (o.include || o.head) {
+            append(r.status + "\n");
+            for (String h : r.headers) append(h + "\n");
+            append("\n");
+        }
+        if (o.head) return;
+        if (outPath != null) {
+            if (!o.silent) append("curl: wrote " + r.bytes + " bytes to " + outPath + "\n");
+            return;
+        }
+        byte[] body = r.body == null ? new byte[0] : r.body;
+        if (isBinary(body)) {
+            append("curl: " + r.bytes + " bytes of binary"
+                    + (r.contentType.length() == 0 ? "" : ", " + r.contentType)
+                    + "; not shown, use -o <file>\n");
+            return;
+        }
+        String text;
+        try { text = new String(body, "UTF-8"); }
+        catch (Exception e) { text = new String(body); }
+        append(text);
+        if (text.length() > 0 && text.charAt(text.length() - 1) != '\n') append("\n");
+        if (r.truncated) {
+            append("curl: truncated at " + (Curl.MAX_MEM / 1024) + "KB, use -o <file>\n");
+        }
+    }
+
+    /** NUL, or more than a few percent of control bytes, means "do not paint this" */
+    private static boolean isBinary(byte[] b) {
+        if (b == null || b.length == 0) return false;
+        int ctrl = 0;
+        for (int i = 0; i < b.length; i++) {
+            int v = b[i] & 0xFF;
+            if (v == 0) return true;
+            if (v < 9 || (v > 13 && v < 32)) ctrl++;
+        }
+        return ctrl > b.length / 20;
+    }
+
+    /** the drive letters the prompt draws, then the session cwd, then tidy up */
+    private String curlPath(String raw, Session s) {
+        String p = raw;
+        if (p.length() >= 2 && p.charAt(1) == ':') {
+            char d = Character.toUpperCase(p.charAt(0));
+            String rest = p.substring(2).replace('\\', '/');
+            while (rest.startsWith("/")) rest = rest.substring(1);
+            if (d == 'D') p = "/storage/emulated/0/" + rest;
+            else if (d == 'E') p = ShellService.PREFIX + "/" + rest;
+            else p = "/" + rest;
+        } else if (!p.startsWith("/")) {
+            String base = (s.cwd == null || s.cwd.isEmpty()) ? "/" : s.cwd;
+            p = base + "/" + p;
+        }
+        return CdPath.resolve(p);
+    }
+
+    private static String curlName(java.util.List<String> urls) {
+        if (urls.isEmpty()) return "download";
+        String u = urls.get(0);
+        int q = u.indexOf('?');
+        if (q >= 0) u = u.substring(0, q);
+        while (u.endsWith("/")) u = u.substring(0, u.length() - 1);
+        int slash = u.lastIndexOf('/');
+        String name = slash >= 0 ? u.substring(slash + 1) : u;
+        return name.length() == 0 ? "index.html" : name;
+    }
+
+    /** null on success, or a line saying why the body could not be placed */
+    private String placeCurl(java.io.File tmp, String path) {
+        java.io.File dest = new java.io.File(path);
+        if (isAppPath(dest)) {
+            return copyFile(tmp, dest) ? null : "cannot write " + path;
+        }
+        // /sdcard outside Android/data is not the app's to write, so stage it
+        // through the transport, which runs as uid 2000 and owns those paths
+        if (sh != null && sh.isReady()) {
+            String res = sh.uploadTo(tmp, path);
+            if (res == null || !res.startsWith("error")) return null;
+            return copyFile(tmp, dest) ? null : res;
+        }
+        return copyFile(tmp, dest) ? null
+                : "cannot write " + path + " with no shell; try cdprefix first";
+    }
+
+    private boolean isAppPath(java.io.File f) {
+        String p = f.getAbsolutePath();
+        java.io.File[] roots = new java.io.File[] {
+            getFilesDir(), getCacheDir(), getExternalFilesDir(null),
+            getExternalCacheDir(), getDataDir(),
+        };
+        for (java.io.File r : roots) {
+            if (r == null) continue;
+            String rp = r.getAbsolutePath();
+            if (p.equals(rp) || p.startsWith(rp + java.io.File.separator)) return true;
+        }
+        return false;
+    }
+
+    private static boolean copyFile(java.io.File src, java.io.File dst) {
+        try {
+            java.io.File parent = dst.getParentFile();
+            if (parent != null && !parent.isDirectory()) parent.mkdirs();
+            java.io.FileInputStream in = new java.io.FileInputStream(src);
+            java.io.FileOutputStream out = new java.io.FileOutputStream(dst);
+            try {
+                byte[] buf = new byte[64 * 1024];
+                int n;
+                while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            } finally {
+                in.close();
+                out.close();
+            }
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     // -------------------------------------------------------------- builtins
@@ -2982,7 +3192,7 @@ sh = s;
         }
 
         if (sub.equals("info")) {
-            append("build:     " + myVersion() + " (code 3)\n"
+            append("build:     " + myVersion() + " (code " + myVersionCode() + ")\n"
                     + "device:    " + headset() + "\n"
                     + "transport: " + transportLine() + "\n"
                     + "adb client:" + (AdbBin.available(this) ? " " : " not in this build, ")
@@ -3433,6 +3643,7 @@ sh = s;
         if (verb.equals("adbroot")) { doAdbRoot(s); return true; }
         if (verb.equals("termdev")) { doTermDev(arg, s); return true; }
         if (verb.equals("badapple") || verb.equals("apple")) { doBadApple(arg); return true; }
+        if (verb.equals("curl")) { doCurl(arg, s); return true; }
         if (verb.equals("adbkillserver")) { doAdbServer(s, true); return true; }
         if (verb.equals("adbstartserver")) { doAdbServer(s, false); return true; }
         if (verb.equals("adbdev")) { doAdbDev(s); return true; }
@@ -4489,8 +4700,15 @@ final String[] keys = {
              + "  run <script>        run a script. .ps1 goes to PowerShell,\n"
              + "                      anything else to the shell. the path is\n"
              + "                      quoted, so spaces are fine\n"
-             + "  su <cmd>          run as root if there is root, else as shell\n\n"
-             + "what is actually different on a Quest\n"
+              + "  su <cmd>          run as root if there is root, else as shell\n\n"
+              + "network\n"
+              + "  curl <url>        fetch an http(s) url in the app, with real TLS\n"
+              + "                    (the device has no curl, and its wget does not\n"
+              + "                    verify certificates). runs with no shell needed.\n"
+              + "                    -o file, -O, -I, -i, -L, -X, -H, -d, -u, -k,\n"
+              + "                    -A, -e, -b, -r, -x, -m all work. 'curl -h'\n"
+              + "                    has the full list and examples\n\n"
+              + "what is actually different on a Quest\n"
              + "  implicit android.settings.* intents never arrive - vrshell's\n"
              + "    AndroidIntentsRelayActivity swallows them, so every settings\n"
              + "    target here is named by component, not by action string.\n"

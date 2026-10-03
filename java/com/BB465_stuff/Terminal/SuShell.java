@@ -28,6 +28,10 @@ final class SuShell implements Transport {
     private static final int PS_TIMEOUT_MS = 25000;
     private static final int EXEC_TIMEOUT_MS = 600000;   // 10 min: root can legitimately take a while
     private static final int PROBE_TIMEOUT_MS = 60000;  // the su prompt may be sitting there unanswered
+    /** same probe the Shizuku service runs, so the banner parses on any transport */
+    private static final String PS_VERSION_CMD =
+            "'BB|' + $PSVersionTable.PSVersion + '|' + $PSVersionTable.PSEdition"
+          + " + '|' + $PSVersionTable.OS + '|' + $PSVersionTable.Platform";
 
     private final String su;
     private final Shell.Callback cb;
@@ -192,7 +196,14 @@ final class SuShell implements Transport {
             };
             reader.setDaemon(true);
             reader.start();
-            return "ok";
+            // see AdbShell: the UI needs the BB| version line, a bare "ok"
+            // leaves the session reported as dead right after it started.
+            String v = psLineNow(PS_VERSION_CMD);
+            if (v != null && v.trim().startsWith("BB|")) return v.trim();
+            if (psProc == null || !psProc.isAlive()) {
+                return "pwsh start failed: the version probe took the session down";
+            }
+            return "BB|unknown|Unknown||";
         } catch (Throwable t) {
             return "pwsh start failed: " + t
                     + "\nis " + ShellService.PWSH + " still installed?";

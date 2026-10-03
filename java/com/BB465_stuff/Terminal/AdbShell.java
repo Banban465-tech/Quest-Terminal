@@ -29,6 +29,10 @@ final class AdbShell implements Transport {
     private static final String PS_SENTINEL = "__BB_PS_DONE_7f3a91c4__";
     private static final int PS_TIMEOUT_MS = 25000;
     private static final int EXEC_TIMEOUT_MS = 600000;
+    /** same probe the Shizuku service runs, so the banner parses on any transport */
+    private static final String PS_VERSION_CMD =
+            "'BB|' + $PSVersionTable.PSVersion + '|' + $PSVersionTable.PSEdition"
+          + " + '|' + $PSVersionTable.OS + '|' + $PSVersionTable.Platform";
 
     private final AdbBin adb;
     private final Context ctx;
@@ -200,7 +204,16 @@ final class AdbShell implements Transport {
             };
             reader.setDaemon(true);
             reader.start();
-            return "ok";
+            // The process is up, but the UI only calls the session live when it
+            // sees a BB| version line. Returning the old bare "ok" meant
+            // pwshstart printed "ok" and left the session dead, so run the same
+            // probe the Shizuku service does and pass it through.
+            String v = psLineNow(PS_VERSION_CMD);
+            if (v != null && v.trim().startsWith("BB|")) return v.trim();
+            if (psProc == null || !psProc.isAlive()) {
+                return "pwsh start failed: the version probe took the session down";
+            }
+            return "BB|unknown|Unknown||";
         } catch (Throwable t) {
             return "pwsh start failed: " + t;
         }

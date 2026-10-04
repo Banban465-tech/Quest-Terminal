@@ -112,6 +112,18 @@ class BadApple {
     private final String path;
     private final boolean loop;
 
+    /**
+     * The name playback was asked for under. This one overlay is shared by
+     * 'termdev badapple' and 'playvideo', and a player that introduces itself as
+     * badapple right after you ran playvideo reads like the wrong command ran.
+     */
+    private String label = "badapple";
+
+    BadApple labelled(String l) {
+        if (l != null && l.length() > 0) label = l;
+        return this;
+    }
+
     private final Handler ui = new Handler(Looper.getMainLooper());
 
     /** fills the pane, and centres the video inside itself */
@@ -143,26 +155,33 @@ class BadApple {
 
     // ------------------------------------------------------------- lifecycle
 
+    /** "clip.mp4" reads better as "clip" once the extension is on screen nowhere */
+    private static String displayName(File f) {
+        String n = f.getName();
+        int dot = n.lastIndexOf('.');
+        return (dot > 0) ? n.substring(0, dot) : n;
+    }
+
     /** @return null on success, otherwise the reason it would not start */
     String start() {
         File f = new File(path);
         if (!f.isFile() || f.length() == 0) {
-            return "badapple: no file at " + path + "\n";
+            return label + ": no file at " + path + "\n";
         }
 
         long durationUs = probeDuration(f);
         String dims = probeDims(f);
         if (dims == null) {
-            return "badapple: " + f.getName() + " has no video track\n";
+            return label + ": " + displayName(f) + " has no video track\n";
         }
 
         // report before attaching. Attaching first puts the overlay over the
         // scroll area before this lands, so the message saying what is playing
         // prints underneath the video and nobody sees it.
-        say.say("badapple: " + f.getName() + "\n"
+        say.say(label + ": " + displayName(f) + "\n"
                 + "  " + dims + ", " + hhmmss(durationUs / 1000000L)
                 + (loop ? ", looping" : "") + "\n"
-                + "  'badapple stop', tap it, or press any key\n");
+                + "  '" + label + " stop', tap it, or press any key\n");
 
         // a FrameLayout holds the pane, so the pane can be centred and letterboxed
         // inside the slot instead of being stretched or pinned to a corner
@@ -228,7 +247,7 @@ class BadApple {
         } catch (Throwable e) {
             Log.w(TAG, "badapple could not open " + f.getName(), e);
             stop(null);
-            return "badapple: " + f.getName() + " would not open\n"
+            return label + ": " + displayName(f) + " would not open\n"
                     + "  " + e.getClass().getSimpleName() + ": " + e.getMessage() + "\n";
         }
         return null;

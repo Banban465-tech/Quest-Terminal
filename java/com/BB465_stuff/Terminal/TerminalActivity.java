@@ -321,8 +321,8 @@ String cwd = "";
                 if (r != android.content.pm.PackageManager.PERMISSION_GRANTED) ok = false;
             }
             append(ok
-                    ? "badapple: granted. type badapple to play it.\n"
-                    : "badapple: denied, so it cannot read the video.\n"
+                    ? "video permission: granted. type playvideo to play something.\n"
+                    : "video permission: denied, so it cannot read the video.\n"
                       + "  without it there is nothing to show. grant it in\n"
                       + "  Settings > Apps > Terminal > Permissions.\n");
             return;
@@ -1790,8 +1790,8 @@ sh = s;
         if (!haveCache && !hasMediaRead()) {
             requestMediaRead();
             append("badapple: no cached copy, and reading video needs permission.\n"
-                    + "  asked for it. accept it, or just type badapple again to\n"
-                    + "  download instead.\n");
+                    + "  asked for it. accept it, or just type termdev badapple\n"
+                    + "  again to download instead.\n");
             return;
         }
 
@@ -1808,7 +1808,7 @@ sh = s;
             return;
         }
 
-        startApple(f, fps, loop);
+        startApple(f, fps, loop, "badapple");
     }
 
     /** pull the video down on a worker, then start playing it */
@@ -1844,7 +1844,7 @@ sh = s;
                         }
                         append("badapple: got it in "
                                 + ((System.currentTimeMillis() - t0) / 1000L) + "s\n");
-                        startApple(AppleSource.cached(TerminalActivity.this), fps, loop);
+                        startApple(AppleSource.cached(TerminalActivity.this), fps, loop, "badapple");
                     }
                 });
             }
@@ -1854,7 +1854,7 @@ sh = s;
     }
 
     /** start playback on an already-resolved file */
-    private void startApple(java.io.File f, int fps, boolean loop) {
+    private void startApple(java.io.File f, int fps, boolean loop, String label) {
         if (apple != null) {
             apple.stop(null);
             apple = null;
@@ -1867,7 +1867,7 @@ sh = s;
                 // one, so only clear the field if it is still ours
                 if (apple == slot[0]) apple = null;
             }
-        }, f.getAbsolutePath(), fps, loop);
+        }, f.getAbsolutePath(), fps, loop).labelled(label);
         slot[0] = ba;
         apple = ba;
         String err = ba.start();
@@ -1901,15 +1901,15 @@ sh = s;
 
     private String appleHelp() {
         return "hehe\n\n"
-            + "badapple [file|url] [fps=N] [once|loop]\n"
-            + "  also reachable as: termdev badapple [same args]\n"
+            + "termdev badapple [file|url] [fps=N] [once|loop]\n"
             + "  plays it over the app in its own view, so the frames never\n"
             + "  land in the scrollback and the terminal stays usable\n\n"
-            + "  badapple                play it, downloading first if needed\n"
-            + "  badapple once fps=12    straight through, no loop\n"
-            + "  badapple <url>          fetch that url instead of the default\n"
-            + "  badapple <file>         play a file already on the headset\n"
-            + "  badapple stop           stop it early\n\n"
+            + "  termdev badapple                play it, downloading first if needed\n"
+            + "  termdev badapple once fps=12    straight through, no loop\n"
+            + "  termdev badapple <url>          fetch that url instead of the default\n"
+            + "  termdev badapple <file>         play a file already on the headset\n"
+            + "  termdev badapple stop           stop it early\n\n"
+            + "  for any other video on the headset, use playvideo.\n\n"
             + "  on a headset that has never seen it, the first run pulls about\n"
             + "  12MB and caches it in the app. after that it is instant and\n"
             + "  works with no permission granted and no network.\n\n"
@@ -1998,8 +1998,9 @@ sh = s;
             return;
         }
 
-        append("playvideo: " + f.getName() + "\n");
-        startApple(f, 0, loop);
+        // no announce here: the overlay names the file as it starts, and saying
+        // it twice made playvideo print its own line and then badapple's
+        startApple(f, 0, loop, "playvideo");
     }
 
     /** a named video: as typed, then relative to the session dir, then the usual folders */
@@ -2241,7 +2242,6 @@ sh = s;
             || verb.equals("pkg") || verb.equals("run") || verb.equals("su")
             || verb.equals("update") || verb.equals("updates") || verb.equals("credits")
             || verb.equals("disableupdates") || verb.equals("enableupdates")
-            || verb.equals("badapple") || verb.equals("apple")
             || verb.equals("playvideo")
             || verb.equals("pwshfile") || verb.equals("pwshdemo")
             || verb.equals("curl");
@@ -3928,7 +3928,8 @@ sh = s;
         if (verb.equals("adbtcpip") || verb.equals("adbwireless")) { doAdbTcpip(arg, s); return true; }
         if (verb.equals("adbroot")) { doAdbRoot(s); return true; }
         if (verb.equals("termdev")) { doTermDev(arg, s); return true; }
-        if (verb.equals("badapple") || verb.equals("apple")) { doBadApple(arg); return true; }
+        // no bare 'badapple'/'apple' verb: it shadowed the user's own scripts
+        // and duplicated 'termdev badapple', which is where it lives now.
         if (verb.equals("playvideo")) { doPlayVideo(arg, s); return true; }
         if (verb.equals("curl")) { doCurl(arg, s); return true; }
         if (verb.equals("adbkillserver")) { doAdbServer(s, true); return true; }
@@ -4945,7 +4946,7 @@ final String[] keys = {
               + "  adbstartserver            adb start-server\n"
               + "  adbkillserver             adb kill-server\n"
 + "  termdev                  info | log | savelog | server | selftest\n"
-              + "  badapple                 play a video over the app, not in the scrollback\n"
+              + "  termdev badapple         play a video over the app, not in the scrollback\n"
               + "  playvideo <file>          play any video on the headset, same overlay\n"
               + "  playvideo list            what videos it can see\n"
               + "  adbuse                    go back to Shizuku\n"

@@ -144,6 +144,35 @@ public final class Pkg {
         return s.toString();
     }
 
+    /** header prefix of a watchScript() reply: lines, done, exit code */
+    public static final String WATCH = "BBJ|";
+
+    /**
+     * One poll of the background job: a header line, then the whole log.
+     *
+     * The transport only hands back a command once the process has exited, so
+     * there is nothing to stream into - the app calls this on a timer and shows
+     * the lines it has not seen yet.
+     *
+     * The header counts whole lines only, because 'wc -l' counts newlines. A
+     * line the job is halfway through writing stays invisible until it is
+     * finished, which keeps half a package name off the screen.
+     */
+    public static String watchScript() {
+        StringBuilder s = new StringBuilder();
+        s.append("BB=").append(BB).append('\n');
+        s.append("D=").append(RUNDIR).append('\n');
+        s.append("L=$D/job.log\n");
+        // nohup has not created it yet, so this is "not finished", not "finished"
+        s.append("if [ ! -f \"$L\" ]; then echo '").append(WATCH).append("0|0|no log yet'; exit 0; fi\n");
+        s.append("N=$($BB wc -l < \"$L\" | $BB tr -d ' ')\n");
+        s.append("RC=$($BB cat $D/job.exit 2>/dev/null)\n");
+        s.append("if [ -z \"$RC\" ]; then D=0; RC=running; else D=1; fi\n");
+        s.append("echo \"").append(WATCH).append("$N|$D|$RC\"\n");
+        s.append("$BB cat \"$L\"\n");
+        return s.toString();
+    }
+
     /**
      * Where everything is, and why not somewhere prettier: the app's own data
      * folder cannot hold executables, and that is not a preference.
@@ -203,7 +232,8 @@ public final class Pkg {
              + "into: " + PREFIX + "\n"
              + "\nan install runs in the background, because python is 17\n"
              + "packages and takes minutes. this tab stays usable.\n"
-             + "watch it with:  pkg status\n"
+             + "its progress prints in this tab as it goes.\n"
+             + "check on it later with:  pkg status\n"
              + "\nnote: this lives outside the app, so an uninstall will not\n"
              + "remove it. use 'pkg list' then 'pkg remove' to clean up.\n";
     }

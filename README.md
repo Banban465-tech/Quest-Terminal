@@ -131,7 +131,7 @@ unprivileged app can run a binary from.
 
 - [FreeXR](https://discord.gg/ABCXxDyqrH)
 - yanno1222 / .networth_
-- Kotlin- / gamble_now
+- appnana / gamble_now
 
 `credits` in the app prints the same list.
 

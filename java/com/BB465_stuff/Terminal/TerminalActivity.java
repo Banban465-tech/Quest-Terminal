@@ -131,6 +131,123 @@ String cwd = "";
         }
     };
 
+    // ---------------------------------------------------- pkg install progress
+    //
+    // 'pkg install' runs nohup'd, because a 17-package pull would otherwise
+    // lock the input for minutes. The cost was that the tab said "preparing
+    // python" and then nothing until the user thought to type 'pkg status'.
+    // The log the job writes is polled and echoed here instead.
+
+    private boolean pkgFollow = false;
+    private boolean pkgQuery = false;
+    private int pkgShown = 0;
+    private Session pkgSession;
+    private long pkgUntil = 0;
+
+    private final Runnable pkgPoll = new Runnable() {
+        public void run() {
+            if (!pkgFollow) return;
+            final Session s = pkgSession;
+            // a job killed before it could write job.exit (a reboot, say) would
+            // otherwise be followed forever, printing nothing
+            if (System.currentTimeMillis() > pkgUntil) {
+                pkgFollow = false;
+                appendTo(s, "-- stopped following after 15 minutes. "
+                        + "'pkg status' still reports whatever it wrote --\n");
+                return;
+            }
+            // never talk to the transport while the user has a command of their
+            // own in flight, or the two replies interleave
+            if (s != null && sh != null && !s.busy && !pkgQuery) {
+                pkgQuery = true;
+                sh.execRaw(Pkg.watchScript(), new Shell.Raw() {
+                    public void got(String out) {
+                        pkgQuery = false;
+                        stepPkg(s, out);
+                    }
+                });
+            }
+            if (pkgFollow) tick.postDelayed(this, 1200);
+        }
+    };
+
+    /** start echoing the job log into the tab that asked for it */
+    private void followPkg(Session s, String name) {
+        pkgFollow = false;                 // a second install replaces the first
+        pkgQuery = false;
+        pkgShown = 0;
+        pkgSession = s;
+        pkgFollow = true;
+        pkgUntil = System.currentTimeMillis() + 15 * 60 * 1000L;
+        // a moment's grace: nohup has not created the log yet on the first tick
+        tick.postDelayed(pkgPoll, 700);
+    }
+
+    /** one poll's reply - a header, then the whole log of which we show the new lines */
+    private void stepPkg(Session s, String out) {
+        if (out == null) return;                    // transport hiccup, try again
+        int nl = out.indexOf('\n');
+        if (nl < 0 || !out.startsWith(Pkg.WATCH)) return;
+        String[] f = out.substring(Pkg.WATCH.length(), nl).split("\\|");
+        if (f.length < 3) return;
+        int whole;
+        try { whole = Integer.parseInt(f[0].trim()); }
+        catch (NumberFormatException e) { return; }
+        boolean done = "1".equals(f[1].trim());
+        String rc = f[2].trim();
+
+        // cut the body down to the lines the header counted, so a line still
+        // being written is neither shown nor counted twice
+        String body = out.substring(nl + 1);
+        int cut = 0, seen = 0;
+        while (cut < body.length() && seen < whole) {
+            if (body.charAt(cut) == '\n') seen++;
+            cut++;
+        }
+        if (seen < whole) return;                   // body clipped, ask again
+        if (cut > 0) showPkgLines(s, body.substring(0, cut));
+        pkgShown = whole;
+
+        if (!done) return;
+        pkgFollow = false;
+        appendTo(s, "\n-- install finished, exit code " + rc
+                + ("0".equals(rc) ? "" : ", which is not zero, so read the lines above")
+                + " --\n");
+    }
+
+    /** print the part of the log that has not been printed yet */
+    private void showPkgLines(Session s, String text) {
+        String[] lines = text.split("\n", -1);
+        int n = lines.length;
+        if (n > 0 && lines[n - 1].length() == 0) n--;   // text ends with a newline
+        int from = Math.min(pkgShown, n);
+        if (from >= n) return;
+        StringBuilder b = new StringBuilder();
+        for (int i = from; i < n; i++) b.append(lines[i]).append('\n');
+        appendTo(s, b.toString());
+    }
+
+    /**
+     * Append into one named tab. append() targets whichever tab is on screen,
+     * which is wrong for a background job: its output has to land in the tab
+     * that started it, even if the user has since switched.
+     */
+    private void appendTo(final Session s, final String text) {
+        if (offUi()) {
+            UI.post(new Runnable() {
+                public void run() { appendTo(s, text); }
+            });
+            return;
+        }
+        s.buf.append(text);
+        int cap = pintk("scrollback", 100_000);
+        if (cap < 4_000) cap = 4_000;
+        if (s.buf.length() > cap) {
+            s.buf.delete(0, s.buf.length() - (cap - cap / 5));
+        }
+        render();
+    }
+
     @Override
     protected void onPause() {
         // a decoder thread and an audio player outliving the window is a leak
@@ -1799,6 +1916,162 @@ sh = s;
             + "  tap the video or press any key to stop it\n";
     }
 
+    // ---------------------------------------------------------- playvideo
+
+    /** where a dropped video turns up. badapple searches these too. */
+    private static final String[] MEDIA_DIRS = {
+        "/sdcard/Download", "/sdcard/Downloads",
+        "/storage/emulated/0/Download", "/storage/emulated/0/Downloads",
+        "/storage/emulated/0/Movies", "/data/local/tmp",
+    };
+
+    /**
+     * playvideo <file> - any video on the headset, through the same overlay
+     * badapple uses. BadApple is a general player that happens to have one
+     * particular video and one default url bolted on; this is the general case,
+     * so it never downloads anything and only guesses which file you meant if
+     * you leave the name off.
+     */
+    private void doPlayVideo(String arg, Session s) {
+        String[] a = arg == null ? new String[0] : arg.trim().split("\\s+");
+        String named = "";
+        boolean loop = true;
+        boolean list = false;
+
+        for (String w : a) {
+            if (w.length() == 0) continue;
+            if (w.equals("stop")) {
+                if (apple != null) {
+                    apple.stop("stopped");
+                    apple = null;
+                    append("playvideo: stopped\n");
+                } else {
+                    append("playvideo: nothing playing\n");
+                }
+                return;
+            } else if (w.equals("help")) {
+                append(playVideoHelp());
+                return;
+            } else if (w.equals("list")) {
+                list = true;
+            } else if (w.equals("once")) {
+                loop = false;
+            } else if (w.equals("loop")) {
+                loop = true;
+            } else if (w.startsWith("fps=")) {
+                append("playvideo: fps= is accepted and ignored. it only meant\n"
+                        + "  something back when the frames were drawn as text;\n"
+                        + "  playback is clocked by the audio track.\n");
+                return;
+            } else if (w.startsWith("http://") || w.startsWith("https://")) {
+                append("playvideo: that is an address, not a file.\n"
+                        + "  fetch it first, then play it:\n"
+                        + "    curl -o /sdcard/Download/clip.mp4 " + w + "\n"
+                        + "    playvideo /sdcard/Download/clip.mp4\n");
+                return;
+            } else {
+                named = w;
+            }
+        }
+
+        if (list) { listMedia(); return; }
+
+        java.io.File f = named.length() > 0 ? resolveMedia(named, s) : firstMedia();
+        if (f == null) {
+            append(named.length() > 0
+                    ? "playvideo: no video called '" + named + "'\n"
+                    : "playvideo: no videos found\n");
+            append(playVideoHelp());
+            return;
+        }
+
+        // the app cache needs no grant; shared storage does
+        if (!f.canRead()) {
+            if (!hasMediaRead()) {
+                requestMediaRead();
+                append("playvideo: " + f.getName() + " is on shared storage, which needs\n"
+                        + "  the video permission. asked for it - accept it, then type\n"
+                        + "  'playvideo " + f.getAbsolutePath() + "' again.\n");
+                return;
+            }
+            append("playvideo: cannot read " + f.getAbsolutePath() + "\n");
+            return;
+        }
+
+        append("playvideo: " + f.getName() + "\n");
+        startApple(f, 0, loop);
+    }
+
+    /** a named video: as typed, then relative to the session dir, then the usual folders */
+    private java.io.File resolveMedia(String named, Session s) {
+        java.io.File direct = new java.io.File(named);
+        if (isVideo(direct)) return direct;
+        if (s != null && s.cwd != null) {
+            java.io.File rel = new java.io.File(s.cwd, named);
+            if (isVideo(rel)) return rel;
+        }
+        for (String d : MEDIA_DIRS) {
+            java.io.File f = new java.io.File(d, named);
+            if (isVideo(f)) return f;
+        }
+        return null;
+    }
+
+    /** nothing named, so take the first video in the first folder that has one */
+    private java.io.File firstMedia() {
+        for (String d : MEDIA_DIRS) {
+            java.io.File[] kids = new java.io.File(d).listFiles();
+            if (kids == null) continue;
+            java.util.Arrays.sort(kids);
+            for (java.io.File f : kids) {
+                if (isVideo(f)) return f;
+            }
+        }
+        java.io.File cached = AppleSource.cached(this);
+        return isVideo(cached) ? cached : null;
+    }
+
+    private void listMedia() {
+        int n = 0;
+        for (String d : MEDIA_DIRS) {
+            java.io.File[] kids = new java.io.File(d).listFiles();
+            if (kids == null) continue;
+            java.util.Arrays.sort(kids);
+            for (java.io.File f : kids) {
+                if (!isVideo(f)) continue;
+                n++;
+                append("  " + f.getAbsolutePath() + "  "
+                        + (f.length() / 1048576L) + "MB\n");
+            }
+        }
+        java.io.File cached = AppleSource.cached(this);
+        if (isVideo(cached)) {
+            n++;
+            append("  " + cached.getAbsolutePath() + "  (app cache)\n");
+        }
+        if (n == 0) append("no videos in Download, Downloads, Movies or /data/local/tmp\n");
+        else append(n + " video(s)\n");
+    }
+
+    private String playVideoHelp() {
+        return "playvideo\n\n"
+            + "playvideo <file> [once|loop]\n"
+            + "  also reachable as: termdev playvideo [same args]\n"
+            + "  plays any video already on the headset, in its own view over the\n"
+            + "  app, so the frames never land in the scrollback\n\n"
+            + "  playvideo              play the first video it finds\n"
+            + "  playvideo list         every video it can see, with sizes\n"
+            + "  playvideo <file>       play that one\n"
+            + "  playvideo <file> once  straight through, no loop\n"
+            + "  playvideo stop         stop it early\n\n"
+            + "  a bare name is looked for in the current directory first, so\n"
+            + "  'cd /sdcard/Movies' then 'playvideo clip.mp4' works. failing\n"
+            + "  that it tries Download, Downloads, Movies and /data/local/tmp.\n\n"
+            + "  an http address is not a file. fetch it with curl first:\n"
+            + "    curl -o /sdcard/Download/clip.mp4 https://host/clip.mp4\n\n"
+            + "  tap the video or press any key to stop it\n";
+    }
+
     private int dp(int v) {
         return (int) (v * getResources().getDisplayMetrics().density);
     }
@@ -1914,7 +2187,7 @@ sh = s;
         append("credits to:\n"
              + "  FreeXR      https://discord.gg/ABCXxDyqrH\n"
              + "  yanno1222 / .networth_\n"
-             + "  Kotlin- / gamble_now\n"
+             + "  appnana / gamble_now\n"
              + "\n"
              + "badapple:\n"
              + "  ZUN / Team Shanghai Alice    original 'Bad Apple!!' (Touhou 4: Lotus Land Story)\n"
@@ -1969,6 +2242,7 @@ sh = s;
             || verb.equals("update") || verb.equals("updates") || verb.equals("credits")
             || verb.equals("disableupdates") || verb.equals("enableupdates")
             || verb.equals("badapple") || verb.equals("apple")
+            || verb.equals("playvideo")
             || verb.equals("pwshfile") || verb.equals("pwshdemo")
             || verb.equals("curl");
     }
@@ -3153,6 +3427,18 @@ sh = s;
             return;
         }
 
+        if (sub.equals("playvideo")) {
+            // same pass-through, so 'termdev playvideo clip.mp4 once' means
+            // exactly what 'playvideo clip.mp4 once' means
+            StringBuilder rest = new StringBuilder();
+            for (int i = 1; i < a.length; i++) {
+                if (rest.length() > 0) rest.append(' ');
+                rest.append(a[i]);
+            }
+            doPlayVideo(rest.toString(), s);
+            return;
+        }
+
         if (sub.equals("keys")) {
             append(AdbBin.keyReport());
             append("\nthis is app-private storage, so it survives a restart and a\n"
@@ -3643,6 +3929,7 @@ sh = s;
         if (verb.equals("adbroot")) { doAdbRoot(s); return true; }
         if (verb.equals("termdev")) { doTermDev(arg, s); return true; }
         if (verb.equals("badapple") || verb.equals("apple")) { doBadApple(arg); return true; }
+        if (verb.equals("playvideo")) { doPlayVideo(arg, s); return true; }
         if (verb.equals("curl")) { doCurl(arg, s); return true; }
         if (verb.equals("adbkillserver")) { doAdbServer(s, true); return true; }
         if (verb.equals("adbstartserver")) { doAdbServer(s, false); return true; }
@@ -4238,7 +4525,7 @@ sb.append("  termdev                  info | log | savelog | server | selftest\n
         // exits, so blocking left the input locked and the screen blank for the
         // minutes 17 packages take. The script goes up as a file and is started
         // with nohup; the user watches it with 'pkg status'.
-        append("preparing " + name + "...\n");
+        append("preparing " + name + ", progress prints below as it goes\n");
         s.busy = true;
         stageInstallScript(name, s);
     }
@@ -4277,6 +4564,7 @@ sb.append("  termdev                  info | log | savelog | server | selftest\n
                             return;
                         }
                         sh.exec(Pkg.launchScript(), s.cwd);
+                        followPkg(s, name);
                     }
                 });
             }
@@ -4658,6 +4946,8 @@ final String[] keys = {
               + "  adbkillserver             adb kill-server\n"
 + "  termdev                  info | log | savelog | server | selftest\n"
               + "  badapple                 play a video over the app, not in the scrollback\n"
+              + "  playvideo <file>          play any video on the headset, same overlay\n"
+              + "  playvideo list            what videos it can see\n"
               + "  adbuse                    go back to Shizuku\n"
              + "  su [command]              root via the app's own su\n"
              + "  askforsu                  same, but waits 60s for the prompt\n"

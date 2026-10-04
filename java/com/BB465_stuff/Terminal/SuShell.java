@@ -169,13 +169,109 @@ final class SuShell implements Transport {
         });
     }
 
+    /** same two stdin forms the Shizuku service tries; see the note there */
+    private static final String[] PS_MODE_COMMAND = {
+        "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-" };
+    private static final String[] PS_MODE_PLAIN = {
+        "-NoLogo", "-NoProfile", "-NonInteractive" };
+
     private synchronized String psStartNow() {
         if (psProc != null && psProc.isAlive()) return "already running";
+
+        String pre = psPreflightNow();
+        if (pre != null) return pre;
+
+        String why = "no output";
+        String[][] modes = { PS_MODE_COMMAND, PS_MODE_PLAIN };
+        for (String[] mode : modes) {
+            String spawnErr = psSpawnNow(mode);
+            if (spawnErr == null) {
+                // the UI needs the BB| version line; a bare "ok" leaves the
+                // session reported as dead right after it started
+                String v = psLineNow(PS_VERSION_CMD);
+                String t = v == null ? "" : v.trim();
+                if (t.startsWith("BB|")) return t;
+                why = (psProc == null || !psProc.isAlive())
+                        ? psWhyNow()
+                        : t + " - no version line came back";
+            } else {
+                why = spawnErr;
+            }
+            // this mode is not going to work, so do not leave it holding the slot
+            psKill();
+        }
+        return "pwsh start failed: " + why
+             + "\nis " + ShellService.PWSH + " still installed?";
+    }
+
+    /**
+     * The wrapper is a hand-made stub putting a glibc loader in front of the
+     * real pwsh binary. Nothing here creates it, so ask the device before
+     * blaming pwshstart - the old code threw the message away and told the
+     * user to run a command they had just run.
+     */
+    private String psPreflightNow() {
         try {
-            String cmd = ShellService.envExports() + "; cd " + Su.q(ShellService.PREFIX)
-                    + "; exec sh " + ShellService.shq(ShellService.PWSH)
-                    + " -NoLogo -NoProfile -NonInteractive -Command -";
+            String out = execNow("ls -l " + ShellService.shq(ShellService.PWSH) + " 2>&1", 10000);
+            if (out.contains("No such file")) {
+                return "pwsh wrapper is missing: " + ShellService.PWSH
+                     + "\n  it is a hand-made stub, nothing creates it."
+                     + "\n  the device said: " + out.trim();
+            }
+        } catch (Throwable ignored) { }
+        return null;
+    }
+
+    /**
+     * One synchronous su command, for the preflight that has to answer before
+     * anything else happens. Java's own File API cannot be used here: this
+     * transport runs in the app's uid, and /data/local/tmp belongs to shell, so
+     * only root can say whether the wrapper is really there.
+     *
+     * Returns "" on any failure. The watchdog keeps an unanswered su prompt from
+     * pinning the single worker thread forever.
+     */
+    private String execNow(String cmd, int timeoutMs) {
+        Process p = null;
+        try {
             ProcessBuilder pb = new ProcessBuilder(su, "-c", cmd);
+            pb.redirectErrorStream(true);
+            ShellService.applyEnv(pb.environment());
+            final Process proc = pb.start();
+            p = proc;
+            Thread wd = new Thread("bbterm-su-preflight") {
+                public void run() {
+                    try { Thread.sleep(timeoutMs); } catch (Throwable ignored) { }
+                    try { proc.destroy(); } catch (Throwable ignored) { }
+                }
+            };
+            wd.setDaemon(true);
+            wd.start();
+            StringBuilder b = new StringBuilder();
+            BufferedReader r = new BufferedReader(
+                    new InputStreamReader(proc.getInputStream(), "UTF-8"));
+            String l;
+            while ((l = r.readLine()) != null) b.append(l).append('\n');
+            return b.toString();
+        } catch (Throwable t) {
+            android.util.Log.w("BBterm", "su preflight failed", t);
+            return "";
+        } finally {
+            if (p != null) {
+                try { p.destroy(); } catch (Throwable ignored) { }
+            }
+        }
+    }
+
+    /** start pwsh with these args. null if the process is up, else why it is not */
+    private String psSpawnNow(String[] args) {
+        try {
+            StringBuilder cmd = new StringBuilder();
+            cmd.append(ShellService.envExports()).append("; cd ")
+               .append(Su.q(ShellService.PREFIX))
+               .append("; exec sh ").append(ShellService.shq(ShellService.PWSH));
+            for (int i = 0; i < args.length; i++) cmd.append(' ').append(args[i]);
+            ProcessBuilder pb = new ProcessBuilder(su, "-c", cmd.toString());
             pb.redirectErrorStream(true);
             ShellService.applyEnv(pb.environment());
             psProc = pb.start();
@@ -196,18 +292,27 @@ final class SuShell implements Transport {
             };
             reader.setDaemon(true);
             reader.start();
-            // see AdbShell: the UI needs the BB| version line, a bare "ok"
-            // leaves the session reported as dead right after it started.
-            String v = psLineNow(PS_VERSION_CMD);
-            if (v != null && v.trim().startsWith("BB|")) return v.trim();
-            if (psProc == null || !psProc.isAlive()) {
-                return "pwsh start failed: the version probe took the session down";
-            }
-            return "BB|unknown|Unknown||";
+            return null;
         } catch (Throwable t) {
-            return "pwsh start failed: " + t
-                    + "\nis " + ShellService.PWSH + " still installed?";
+            return "" + t;
         }
+    }
+
+    /** whatever the dead process said on its way out, which is the whole answer */
+    private String psWhyNow() {
+        long until = System.currentTimeMillis() + 800;
+        while (psQ.isEmpty() && System.currentTimeMillis() < until) {
+            try { Thread.sleep(50); } catch (Throwable ignored) { }
+        }
+        StringBuilder b = new StringBuilder();
+        String l;
+        int n = 0;
+        while ((l = psQ.poll()) != null && n < 12) {
+            b.append(l).append('\n');
+            n++;
+        }
+        if (b.length() == 0) b.append("the process exited with no output at all");
+        return b.toString().trim();
     }
 
     public void psLine(final String cmd, final Shell.Raw r) {
@@ -241,10 +346,32 @@ final class SuShell implements Transport {
                             + "\ntimed out after " + (PS_TIMEOUT_MS / 1000)
                             + "s - the session was killed";
                 }
-                String l = psQ.poll(left, TimeUnit.MILLISECONDS);
-                if (l == null) continue;
-                if (l.trim().equals(sentinel)) break;
-                o.append(l).append('\n');
+                String l = psQ.poll(Math.min(left, 200), TimeUnit.MILLISECONDS);
+                if (l != null) {
+                    if (l.trim().equals(sentinel)) break;
+                    o.append(l).append('\n');
+                    continue;
+                }
+                // see ShellService.psLine: wait in slices so a shell that dies
+                // mid-command reports its own last words instead of a timeout
+                if (psProc == null || !psProc.isAlive()) {
+                    boolean finished = false;
+                    long until = System.currentTimeMillis() + 500;
+                    while (System.currentTimeMillis() < until) {
+                        String d = psQ.poll();
+                        if (d == null) {
+                            try { Thread.sleep(50); } catch (Throwable ignored) { }
+                            continue;
+                        }
+                        if (d.trim().equals(sentinel)) { finished = true; break; }
+                        o.append(d).append('\n');
+                    }
+                    if (finished) break;
+                    String said = o.toString().trim();
+                    psKill();
+                    return said.length() > 0 ? said
+                            : "the powershell session exited while running that";
+                }
             }
         } catch (Throwable t) {
             psKill();

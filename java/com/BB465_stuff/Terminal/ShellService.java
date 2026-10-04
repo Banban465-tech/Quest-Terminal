@@ -9,6 +9,8 @@ import java.io.File;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -340,24 +342,110 @@ public class ShellService extends Binder {
      * the whole session. No TTY means no prompt of its own, so the app draws the
      * PS C:\...> line itself.
      */
+    /** why the last start attempt failed, carried into the reply */
+    private String psFail = "";
+
+    /**
+     * Two ways to hand pwsh a stdin. "-Command -" is the documented "read the
+     * script from standard input" form, but how much it buffers before running
+     * a line varies between versions, and a form that waits for EOF can never
+     * answer a sentinel written into the middle of the stream - which is
+     * exactly this design. So the plain form is kept as a fallback and
+     * whichever one actually produces the version probe is the one left up.
+     */
+    private static final String[] PS_MODE_COMMAND = {
+        "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-" };
+    private static final String[] PS_MODE_PLAIN = {
+        "-NoLogo", "-NoProfile", "-NonInteractive" };
+
     private synchronized Result psStart() {
         Result r = new Result();
         if (psProc != null && psProc.isAlive()) {
             r.out = "already running";
             return r;
         }
+        String pre = psPreflight();
+        if (pre != null) {
+            r.err = pre;
+            r.code = -1;
+            return r;
+        }
+
+        String why = "no output";
+        String[][] modes = { PS_MODE_COMMAND, PS_MODE_PLAIN };
+        for (String[] mode : modes) {
+            String spawnErr = psSpawn(mode);
+            if (spawnErr == null) {
+                String probe = psProbe();
+                if (probe != null) {
+                    r.out = probe;
+                    return r;
+                }
+                why = psFail;
+            } else {
+                why = spawnErr;
+            }
+            // this mode is not going to work, so do not leave it holding the slot
+            psKill();
+            android.util.Log.i("BBterm", "pwsh mode " + java.util.Arrays.toString(mode)
+                    + " did not come up: " + why);
+        }
+        r.err = "pwsh start failed: " + why
+              + "\nis " + PWSH + " still installed?";
+        r.code = -1;
+        return r;
+    }
+
+    /**
+     * The wrapper is a hand-made stub - a shell script that puts a glibc loader
+     * in front of the real pwsh binary. Nothing in this app creates it, and
+     * /data/local/tmp does not survive every reboot or factory reset, so its
+     * absence is checked up front. Saying so plainly beats letting sh fail and
+     * then reporting "run pwshstart first" to someone who just did.
+     */
+    private static String psPreflight() {
+        File w = new File(PWSH);
+        if (!w.exists()) {
+            String have;
+            File dir = w.getParentFile();
+            String[] kids = (dir == null) ? null : dir.list();
+            if (kids == null) {
+                have = "\n  " + dir + " could not be listed";
+            } else if (kids.length == 0) {
+                have = "\n  " + dir + " is empty";
+            } else {
+                java.util.Arrays.sort(kids);
+                StringBuilder b = new StringBuilder();
+                for (int i = 0; i < kids.length && i < 12; i++) {
+                    if (b.length() > 0) b.append(' ');
+                    b.append(kids[i]);
+                }
+                have = "\n  what is in " + dir + ": " + b;
+            }
+            return "pwsh wrapper is missing: " + PWSH
+                 + "\n  it is a hand-made stub, nothing creates it." + have;
+        }
+        if (!w.canRead()) return "pwsh wrapper is not readable: " + PWSH;
+        return null;
+    }
+
+    /** start pwsh with these args. null if the process is up, else why it is not */
+    private String psSpawn(String[] args) {
         try {
             File cwd = new File(PREFIX);
             if (!cwd.isDirectory()) cwd = new File("/");
-            ProcessBuilder pb = new ProcessBuilder(
-                    "sh", PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-");
+            List<String> cmd = new ArrayList<String>();
+            cmd.add("sh");
+            cmd.add(PWSH);
+            for (int i = 0; i < args.length; i++) cmd.add(args[i]);
+            ProcessBuilder pb = new ProcessBuilder(cmd);
             pb.directory(cwd);
             pb.redirectErrorStream(true);
             applyEnv(pb.environment());
             psProc = pb.start();
             psIn = new PrintWriter(psProc.getOutputStream(), true);
             psOutReader = new BufferedReader(
-                    new InputStreamReader(psProc.getInputStream()));
+                    new InputStreamReader(psProc.getInputStream(), "UTF-8"));
             psQ.clear();
             final Process proc = psProc;
             psReader = new Thread("bbterm-ps-reader") {
@@ -379,16 +467,55 @@ public class ShellService extends Binder {
             };
             psReader.setDaemon(true);
             psReader.start();
-            // Process.pid() is not in Android's boot classpath (NoSuchMethodError)
             android.util.Log.i("BBterm", "pwsh started, service pid="
                     + android.os.Process.myPid());
-            r.out = psVersion();
+            return null;
         } catch (Throwable t) {
-            r.err = "pwsh start failed: " + t
-                    + "\nis " + PWSH + " still installed?";
-            r.code = -1;
+            return "" + t;
         }
-        return r;
+    }
+
+    /**
+     * Ask for the version and wait for the sentinel. Returns the BB| line, or
+     * null with the reason in psFail.
+     *
+     * A process that dies during the probe is the case worth reading: sh's
+     * "no such file" or the loader's own error is the entire answer, and it
+     * used to be discarded here and reported as "run pwshstart first".
+     */
+    private String psProbe() {
+        psFail = "";
+        Result v = psLine(PS_VERSION_CMD);
+        String s = (v.out == null) ? "" : v.out.trim();
+        if (v.code == 0 && s.startsWith("BB|")) return s;
+
+        if (psProc == null || !psProc.isAlive()) {
+            // let the reader thread finish delivering the last lines
+            long until = System.currentTimeMillis() + 800;
+            while (psQ.isEmpty() && System.currentTimeMillis() < until) {
+                try { Thread.sleep(50); } catch (Throwable ignored) { }
+            }
+            psFail = psWhy(v);
+            return null;
+        }
+        psFail = (s.length() > 0 ? s : v.err) + " - no version line came back";
+        return null;
+    }
+
+    /** whatever the dead process said on its way out, for the error message */
+    private String psWhy(Result v) {
+        StringBuilder b = new StringBuilder();
+        if (v.err != null && v.err.trim().length() > 0) b.append(v.err.trim());
+        if (b.length() == 0) {
+            String l;
+            int n = 0;
+            while ((l = psQ.poll()) != null && n < 12) {
+                b.append(l).append('\n');
+                n++;
+            }
+        }
+        if (b.length() == 0) b.append("the process exited with no output at all");
+        return b.toString().trim();
     }
 
     private BufferedReader psOutReader;
@@ -399,29 +526,6 @@ public class ShellService extends Binder {
      * prompt) cannot wedge the service; the session is killed so the next
      * pwshstart is clean.
      */
-    /**
-     * Version/edition/os/platform for the banner, always in the BB|... form so
-     * the UI can tell a live session from a dead one by shape alone. A probe
-     * that times out takes the session with it (psLine kills it), and that must
-     * not be reported as a successful start, so the error is passed through.
-     */
-    private String psVersion() {
-        try {
-            Result v = psLine(PS_VERSION_CMD);
-            if (v.code == 0) {
-                String s = v.out == null ? "" : v.out.trim();
-                if (s.startsWith("BB|")) return s;
-            }
-            if (psProc == null || !psProc.isAlive()) {
-                return (v.err != null && v.err.length() > 0) ? v.err
-                        : "pwsh start failed: the version probe took the session down";
-            }
-        } catch (Throwable t) {
-            android.util.Log.w("BBterm", "pwsh version probe failed", t);
-        }
-        return "BB|unknown|Unknown||";
-    }
-
     private synchronized Result psLine(String cmd) {
         Result r = new Result();
         if (psProc == null || !psProc.isAlive() || psIn == null) {
@@ -452,10 +556,41 @@ public class ShellService extends Binder {
                     psKill();
                     return r;
                 }
-                String l = psQ.poll(left, TimeUnit.MILLISECONDS);
-                if (l == null) continue;
-                if (l.trim().equals(sentinel)) break;
-                o.append(l).append('\n');
+                // Wait in short slices and re-check liveness on every one. A pwsh
+                // that dies during startup (stale wrapper, missing loader) used to
+                // sit here for the whole timeout, and the message it printed was
+                // swallowed - so pwshstart only ever came back with "run pwshstart
+                // first" to someone who had just run it.
+                String l = psQ.poll(Math.min(left, 200), TimeUnit.MILLISECONDS);
+                if (l != null) {
+                    if (l.trim().equals(sentinel)) break;
+                    o.append(l).append('\n');
+                    continue;
+                }
+                if (psProc == null || !psProc.isAlive()) {
+                    // give the reader a moment to hand over the last lines
+                    boolean finished = false;
+                    long until = System.currentTimeMillis() + 500;
+                    while (System.currentTimeMillis() < until) {
+                        String d = psQ.poll();
+                        if (d == null) {
+                            try { Thread.sleep(50); } catch (Throwable ignored) { }
+                            continue;
+                        }
+                        if (d.trim().equals(sentinel)) { finished = true; break; }
+                        o.append(d).append('\n');
+                    }
+                    // the command finished and the shell died straight after:
+                    // that is still a successful reply
+                    if (finished) break;
+                    android.util.Log.i("BBterm", "ps: session died during '" + cmd
+                            + "': " + o.toString().trim());
+                    r.err = (o.length() > 0 ? o.toString().trim()
+                            : "the powershell session exited while running that");
+                    r.code = -1;
+                    psKill();
+                    return r;
+                }
             }
         } catch (Throwable t) {
             r.err = "powershell: " + t;

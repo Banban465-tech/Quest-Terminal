@@ -177,14 +177,71 @@ final class AdbShell implements Transport {
         });
     }
 
+    /** same two stdin forms the Shizuku service tries; see the note there */
+    private static final String[] PS_MODE_COMMAND = {
+        "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-" };
+    private static final String[] PS_MODE_PLAIN = {
+        "-NoLogo", "-NoProfile", "-NonInteractive" };
+
     private synchronized String psStartNow() {
         if (psProc != null && psProc.isAlive()) return "already running";
+
+        String pre = psPreflightNow();
+        if (pre != null) return pre;
+
+        String why = "no output";
+        String[][] modes = { PS_MODE_COMMAND, PS_MODE_PLAIN };
+        for (String[] mode : modes) {
+            String spawnErr = psSpawnNow(mode);
+            if (spawnErr == null) {
+                String v = psLineNow(PS_VERSION_CMD);
+                String t = v == null ? "" : v.trim();
+                if (t.startsWith("BB|")) return t;
+                why = (psProc == null || !psProc.isAlive())
+                        ? psWhyNow()
+                        : t + " - no version line came back";
+            } else {
+                why = spawnErr;
+            }
+            // this mode is not going to work, so do not leave it holding the slot
+            psKill();
+        }
+        return "pwsh start failed: " + why
+             + "\nis " + ShellService.PWSH + " still installed?";
+    }
+
+    /**
+     * The wrapper is a hand-made stub - a shell script putting a glibc loader in
+     * front of the real pwsh binary. Nothing here creates it and
+     * /data/local/tmp does not survive every reboot, so ask the device whether
+     * it is there. The old code let sh fail, discarded the message and told the
+     * user to run pwshstart, which they had just done.
+     */
+    private String psPreflightNow() {
         try {
-            String cmd = prefix(ShellService.PREFIX) + "exec sh "
-                    + ShellService.shq(ShellService.PWSH)
-                    + " -NoLogo -NoProfile -NonInteractive -Command -";
+            AdbBin.Result r = adb.shellResult(
+                    prefix("") + "ls -l " + ShellService.shq(ShellService.PWSH)
+                    + " 2>&1", 15000);
+            String out = (r.out == null ? "" : r.out)
+                       + (r.err == null ? "" : r.err);
+            if (r.code != 0 || out.contains("No such file")) {
+                return "pwsh wrapper is missing: " + ShellService.PWSH
+                     + "\n  it is a hand-made stub, nothing creates it."
+                     + "\n  the device said: " + out.trim();
+            }
+        } catch (Throwable ignored) { }
+        return null;
+    }
+
+    /** start pwsh with these args. null if the process is up, else why it is not */
+    private String psSpawnNow(String[] args) {
+        try {
+            StringBuilder cmd = new StringBuilder();
+            cmd.append(prefix(ShellService.PREFIX)).append("exec sh ")
+               .append(ShellService.shq(ShellService.PWSH));
+            for (int i = 0; i < args.length; i++) cmd.append(' ').append(args[i]);
             ProcessBuilder pb = new ProcessBuilder(
-                    AdbBin.binaryPath(ctx), "-s", adb.device(), "shell", cmd);
+                    AdbBin.binaryPath(ctx), "-s", adb.device(), "shell", cmd.toString());
             pb.redirectErrorStream(true);
             psProc = pb.start();
             psIn = new PrintWriter(psProc.getOutputStream(), true);
@@ -204,19 +261,27 @@ final class AdbShell implements Transport {
             };
             reader.setDaemon(true);
             reader.start();
-            // The process is up, but the UI only calls the session live when it
-            // sees a BB| version line. Returning the old bare "ok" meant
-            // pwshstart printed "ok" and left the session dead, so run the same
-            // probe the Shizuku service does and pass it through.
-            String v = psLineNow(PS_VERSION_CMD);
-            if (v != null && v.trim().startsWith("BB|")) return v.trim();
-            if (psProc == null || !psProc.isAlive()) {
-                return "pwsh start failed: the version probe took the session down";
-            }
-            return "BB|unknown|Unknown||";
+            return null;
         } catch (Throwable t) {
-            return "pwsh start failed: " + t;
+            return "" + t;
         }
+    }
+
+    /** whatever the dead process said on its way out, which is the whole answer */
+    private String psWhyNow() {
+        long until = System.currentTimeMillis() + 800;
+        while (psQ.isEmpty() && System.currentTimeMillis() < until) {
+            try { Thread.sleep(50); } catch (Throwable ignored) { }
+        }
+        StringBuilder b = new StringBuilder();
+        String l;
+        int n = 0;
+        while ((l = psQ.poll()) != null && n < 12) {
+            b.append(l).append('\n');
+            n++;
+        }
+        if (b.length() == 0) b.append("the process exited with no output at all");
+        return b.toString().trim();
     }
 
     public void psLine(final String cmd, final Shell.Raw r) {
@@ -249,10 +314,32 @@ final class AdbShell implements Transport {
                     return o.toString() + "\ntimed out after "
                             + (PS_TIMEOUT_MS / 1000) + "s - the session was killed";
                 }
-                String l = psQ.poll(left, TimeUnit.MILLISECONDS);
-                if (l == null) continue;
-                if (l.trim().equals(sentinel)) break;
-                o.append(l).append('\n');
+                String l = psQ.poll(Math.min(left, 200), TimeUnit.MILLISECONDS);
+                if (l != null) {
+                    if (l.trim().equals(sentinel)) break;
+                    o.append(l).append('\n');
+                    continue;
+                }
+                // see ShellService.psLine: wait in slices so a shell that dies
+                // mid-command reports its own last words instead of a timeout
+                if (psProc == null || !psProc.isAlive()) {
+                    boolean finished = false;
+                    long until = System.currentTimeMillis() + 500;
+                    while (System.currentTimeMillis() < until) {
+                        String d = psQ.poll();
+                        if (d == null) {
+                            try { Thread.sleep(50); } catch (Throwable ignored) { }
+                            continue;
+                        }
+                        if (d.trim().equals(sentinel)) { finished = true; break; }
+                        o.append(d).append('\n');
+                    }
+                    if (finished) break;
+                    String said = o.toString().trim();
+                    psKill();
+                    return said.length() > 0 ? said
+                            : "the powershell session exited while running that";
+                }
             }
         } catch (Throwable t) {
             psKill();

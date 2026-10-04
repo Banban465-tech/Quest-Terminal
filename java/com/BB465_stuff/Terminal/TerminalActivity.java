@@ -2057,7 +2057,6 @@ sh = s;
     private String playVideoHelp() {
         return "playvideo\n\n"
             + "playvideo <file> [once|loop]\n"
-            + "  also reachable as: termdev playvideo [same args]\n"
             + "  plays any video already on the headset, in its own view over the\n"
             + "  app, so the frames never land in the scrollback\n\n"
             + "  playvideo              play the first video it finds\n"
@@ -3424,18 +3423,6 @@ sh = s;
                 rest.append(a[i]);
             }
             doBadApple(rest.toString());
-            return;
-        }
-
-        if (sub.equals("playvideo")) {
-            // same pass-through, so 'termdev playvideo clip.mp4 once' means
-            // exactly what 'playvideo clip.mp4 once' means
-            StringBuilder rest = new StringBuilder();
-            for (int i = 1; i < a.length; i++) {
-                if (rest.length() > 0) rest.append(' ');
-                rest.append(a[i]);
-            }
-            doPlayVideo(rest.toString(), s);
             return;
         }
 

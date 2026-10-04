@@ -267,9 +267,15 @@ final class SuShell implements Transport {
     private String psSpawnNow(String[] args) {
         try {
             StringBuilder cmd = new StringBuilder();
-            cmd.append(ShellService.envExports()).append("; cd ")
-               .append(Su.q(ShellService.PREFIX))
-               .append("; exec sh ").append(ShellService.shq(ShellService.PWSH));
+            // same reason as the adb transport: this directory is normally made
+            // by the Shizuku service. Here it is only a `;` away from the exec
+            // so a missing directory left the cwd at / instead of breaking the
+            // launch, but the session still deserves to start where it claims.
+            cmd.append(ShellService.envExports());
+            cmd.append("; mkdir -p ").append(ShellService.shq(ShellService.PREFIX))
+               .append(" 2>/dev/null");
+            cmd.append("; cd ").append(Su.q(ShellService.PREFIX)).append(" || exit 3");
+            cmd.append("; exec sh ").append(ShellService.shq(ShellService.PWSH));
             for (int i = 0; i < args.length; i++) cmd.append(' ').append(args[i]);
             ProcessBuilder pb = new ProcessBuilder(su, "-c", cmd.toString());
             pb.redirectErrorStream(true);

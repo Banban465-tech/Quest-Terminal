@@ -236,9 +236,20 @@ final class AdbShell implements Transport {
     /** start pwsh with these args. null if the process is up, else why it is not */
     private String psSpawnNow(String[] args) {
         try {
+            // PREFIX is created by the Shizuku service, which this device does
+            // not have. The old command was `cd PREFIX && exec sh ...`, so when
+            // the directory was missing the cd failed, && swallowed it, exec
+            // never ran, and the remote shell exited 0 with no output at all -
+            // which is why pwshstart did nothing and reported no session. Create
+            // the directory, and exit loudly rather than silently if it cannot
+            // be created.
             StringBuilder cmd = new StringBuilder();
-            cmd.append(prefix(ShellService.PREFIX)).append("exec sh ")
-               .append(ShellService.shq(ShellService.PWSH));
+            cmd.append(ShellService.envExports());
+            cmd.append("; mkdir -p ").append(ShellService.shq(ShellService.PREFIX))
+               .append(" 2>/dev/null");
+            cmd.append("; cd ").append(ShellService.shq(ShellService.PREFIX))
+               .append(" || exit 3");
+            cmd.append("; exec sh ").append(ShellService.shq(ShellService.PWSH));
             for (int i = 0; i < args.length; i++) cmd.append(' ').append(args[i]);
             ProcessBuilder pb = new ProcessBuilder(
                     AdbBin.binaryPath(ctx), "-s", adb.device(), "shell", cmd.toString());
@@ -373,7 +384,12 @@ final class AdbShell implements Transport {
     private static String prefix(String cwd) {
         StringBuilder sb = new StringBuilder(ShellService.envExports());
         sb.append("; ");
-        if (cwd != null && cwd.length() > 0) sb.append("cd ").append(Su.q(cwd)).append(" && ");
+        if (cwd != null && cwd.length() > 0) {
+            // `cd X && cmd` turned a missing directory into a silent no-op: the
+            // remote shell exited 0, the caller saw empty output and no error
+            // anywhere. Fail with a status instead of pretending it worked.
+            sb.append("cd ").append(Su.q(cwd)).append(" 2>/dev/null || exit 3; ");
+        }
         return sb.toString();
     }
 

@@ -584,8 +584,70 @@ public class Shell implements Transport {
         t.start();
     }
 
+    /**
+     * A binder transaction carries about 1MB, so the file cannot ride in one
+     * Parcel: pushing a 2.7MB apk in one go threw
+     * TransactionTooLargeException, which the update menu then showed as
+     * "download failed" (installUpdate runs inside the download try). Above
+     * SINGLE_SHOT the file travels as one part per transaction and is joined
+     * with `cat` - that only needs MSG_UPLOAD and MSG_EXEC, so it works against
+     * a :bbterm that is already running.
+     */
+    private static final int PART_BYTES = 256 * 1024;
+    private static final long SINGLE_SHOT = 768L * 1024;
+
     /** MSG_UPLOAD, returns the number of bytes the service wrote out */
     private long pushFile(java.io.File f, String remote) throws Exception {
+        long len = f.length();
+        if (len <= SINGLE_SHOT) return uploadPart(remote, readAll(f), len);
+
+        // stamped, so parts left by an interrupted run are never globbed in
+        String base = remote + "." + Long.toHexString(System.currentTimeMillis()) + ".";
+        int parts = (int) ((len + PART_BYTES - 1) / PART_BYTES);
+        int width = Math.max(3, String.valueOf(parts - 1).length());
+        String quotedBase = sq(base);
+        long sent = 0;
+        java.io.FileInputStream in = new java.io.FileInputStream(f);
+        try {
+            for (int i = 0; i < parts; i++) {
+                byte[] buf = new byte[PART_BYTES];
+                int got = 0;
+                while (got < PART_BYTES) {
+                    int n = in.read(buf, got, PART_BYTES - got);
+                    if (n <= 0) break;
+                    got += n;
+                }
+                if (got == 0) break;
+                String name = base + String.format(java.util.Locale.US, "%0" + width + "d", i);
+                uploadPart(name, got == buf.length ? buf : trim(buf, got), got);
+                sent += got;
+            }
+        } finally {
+            try { in.close(); } catch (Throwable ignored) { }
+        }
+        if (sent != len) {
+            dropParts(quotedBase);
+            throw new IllegalStateException("short upload: sent " + sent + " of " + len);
+        }
+        // one command joins them. the glob has to stay unquoted to expand, so
+        // only the path in front of it is quoted.
+        Res res = call("cat " + quotedBase + "* > " + sq(remote)
+                + " && rm -f " + quotedBase + "*");
+        if (res.code != 0) {
+            dropParts(quotedBase);
+            throw new IllegalStateException("joining the parts failed: "
+                    + (res.err == null ? "" : res.err.trim()));
+        }
+        long got = sizeOf(remote);
+        if (got != len) {
+            dropParts(quotedBase);
+            throw new IllegalStateException("short file: got " + got + " of " + len);
+        }
+        return got;
+    }
+
+    /** one MSG_UPLOAD carrying exactly these bytes, writing `path` fresh */
+    private long uploadPart(String path, byte[] buf, long expect) throws Exception {
         IBinder b = svc;
         if (b == null) throw new IllegalStateException("no service");
         Parcel d = Parcel.obtain();
@@ -593,21 +655,10 @@ public class Shell implements Transport {
         try {
             d.writeInterfaceToken(ShellService.DESCRIPTOR);
             d.writeInt(0);
-            d.writeString(remote);
-            d.writeInt((int) f.length());
-            java.io.FileInputStream in = new java.io.FileInputStream(f);
-            try {
-                byte[] buf = new byte[32 * 1024];
-                long total = 0;
-                int n;
-                while (total < f.length() && (n = in.read(buf)) > 0) {
-                    d.writeByteArray(buf, 0, n);
-                    total += n;
-                }
-                d.writeInt((int) total);
-            } finally {
-                in.close();
-            }
+            d.writeString(path);
+            d.writeInt((int) expect);
+            d.writeByteArray(buf);
+            d.writeInt((int) expect);
             if (!b.transact(ShellService.MSG_UPLOAD, d, r, 0)) {
                 // false only when the callee does not know the code - the bound
                 // :bbterm predates the upload message.
@@ -626,17 +677,56 @@ public class Shell implements Transport {
             if (code != 0) {
                 throw new IllegalStateException("upload failed, code " + code);
             }
-            long n;
             try {
-                n = Long.parseLong(out == null ? "0" : out.trim());
+                return Long.parseLong(out == null ? "0" : out.trim());
             } catch (NumberFormatException e) {
                 throw new IllegalStateException("unexpected upload reply: " + out);
             }
-            return n;
         } finally {
             d.recycle();
             r.recycle();
         }
+    }
+
+    private void dropParts(String quotedBase) {
+        try { call("rm -f " + quotedBase + "*"); } catch (Throwable ignored) { }
+    }
+
+    /** byte count on the far side, or -1 when it cannot be read */
+    private long sizeOf(String path) {
+        Res res = call("wc -c < " + sq(path));
+        if (res.code != 0 || res.out == null) return -1;
+        try { return Long.parseLong(res.out.trim()); } catch (NumberFormatException e) { return -1; }
+    }
+
+    private static byte[] readAll(java.io.File f) throws Exception {
+        int len = (int) f.length();
+        byte[] out = new byte[len];
+        java.io.FileInputStream in = new java.io.FileInputStream(f);
+        try {
+            int got = 0;
+            while (got < len) {
+                int n = in.read(out, got, len - got);
+                if (n <= 0) break;
+                got += n;
+            }
+            return out;
+        } finally {
+            in.close();
+        }
+    }
+
+    private static byte[] trim(byte[] buf, int got) {
+        if (got >= buf.length) return buf;
+        byte[] out = new byte[got];
+        System.arraycopy(buf, 0, out, 0, got);
+        return out;
+    }
+
+    /** single-quoted for sh; the only wrinkle is an embedded single quote */
+    private static String sq(String s) {
+        if (s == null) return "''";
+        return "'" + s.replace("'", "'\\''") + "'";
     }
 
     /** a null reply means the service does not know the message at all */

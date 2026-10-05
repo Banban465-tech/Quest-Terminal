@@ -2616,7 +2616,14 @@ sh = s;
                                     });
                                 }
                             });
-                            msg = installUpdate(f, mine);
+                            // separate, or a failure in the upload reads as a
+                            // download failure and sends you looking for a
+                            // network problem that is not there
+                            try {
+                                msg = installUpdate(f, mine);
+                            } catch (Throwable t) {
+                                msg = "install failed: " + t.getMessage();
+                            }
                         } catch (Throwable t) {
                             msg = "download failed: " + t.getMessage();
                         }

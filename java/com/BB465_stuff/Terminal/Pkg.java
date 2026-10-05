@@ -263,6 +263,75 @@ public final class Pkg {
           + "-e 's/^[ \\t]*//' -e 's/[ \\t].*$//' "
           + "| $BB grep -v '^$'";
 
+    /** the one-line program fetch() hands the url and destination to */
+    private static final String PY_FETCH =
+            "import sys,ssl,os,urllib.request as u"
+          + ";ca=sys.argv[3]"
+          + ";ctx=ssl.create_default_context(cafile=ca) if ca and os.path.exists(ca)"
+          + " else ssl._create_unverified_context()"
+          + ";open(sys.argv[2],\"wb\").write(u.urlopen(sys.argv[1],timeout=60,context=ctx).read())";
+
+    /**
+     * Download a URL to a file, as a shell function: fetch URL OUTFILE.
+     *
+     * Meta Quest's toybox is built without wget - checked on the headset:
+     * 'wget: inaccessible or not found', and there is no curl and no other
+     * HTTP client on the device either, so the old direct wget call failed at
+     * '[1/4] fetching the package index' and every install died on arrival.
+     * python3 is the fallback, because pkg itself put it there.
+     *
+     * HTTPS there is better than it looks: ca-certificates ships
+     * etc/tls/cert.pem, so this verifies when that file is present rather than
+     * falling back the way toybox wget would have done. Only when the bundle is
+     * absent does it degrade to an unverified fetch, which is still what the
+     * checksum later in the script is for.
+     *
+     * The python is written on one line inside single quotes, so it survives
+     * being read both from a pushed file and from a string passed to sh -c, and
+     * it contains no single quote of its own.
+     */
+    private static final String FETCH_FN =
+            "fetch() {\n"
+          + "  if command -v wget >/dev/null 2>&1; then\n"
+          + "    wget -q -O \"$2\" \"$1\"; return $?\n"
+          + "  fi\n"
+          + "  if command -v curl >/dev/null 2>&1; then\n"
+          + "    curl -fsSL -o \"$2\" \"$1\"; return $?\n"
+          + "  fi\n"
+          + "  PY=\"$(command -v python3 2>/dev/null || true)\"\n"
+          + "  [ -z \"$PY\" ] && [ -x \"$P/bin/python3\" ] && PY=\"$P/bin/python3\"\n"
+          + "  if [ -n \"$PY\" ]; then\n"
+          + "    \"$PY\" -c '" + PY_FETCH + "' \"$1\" \"$2\" \"$P/etc/tls/cert.pem\"\n"
+          + "    return $?\n"
+          + "  fi\n"
+          + "  echo \"  ! no HTTP client here: needs wget, curl or python3\"\n"
+          + "  return 1\n"
+          + "}\n";
+
+    /**
+     * Unpacks a .deb's ar container when the device has no ar. Written to the
+     * work directory by installScript only when python3 is present.
+     *
+     * ar is 8 bytes of magic, then 60-byte headers of name, mtime, uid, gid,
+     * mode and size in ASCII, followed by the payload padded to an even offset.
+     * A .deb holds three members (debian-binary, control.tar.*, data.tar.*) and
+     * all three are short enough for the name to fit in the header's 16 bytes,
+     * so the long-name table never comes into it.
+     */
+    private static final String ARX_PY =
+            "import sys\n"
+          + "d=open(sys.argv[1],\"rb\").read()\n"
+          + "if d[:8]!=b\"!<arch>\\n\": sys.exit(\"not an ar archive\")\n"
+          + "i=8\n"
+          + "while i+60<=len(d):\n"
+          + "    h=d[i:i+60]; name=h[:16].decode(\"ascii\",\"replace\").strip().rstrip(\"/\")\n"
+          + "    try: size=int(h[48:58].strip() or 0)\n"
+          + "    except ValueError: break\n"
+          + "    i+=60\n"
+          + "    if i+size>len(d): break\n"
+          + "    if name: open(name,\"wb\").write(d[i:i+size])\n"
+          + "    i+=size+(size&1)\n";
+
     public static String installScript(String pkg) {
         StringBuilder s = new StringBuilder();
         s.append("BB=").append(BB).append('\n');
@@ -273,11 +342,23 @@ public final class Pkg {
         s.append("set -u\n");
         s.append("cd $W 2>/dev/null || { $BB mkdir -p $W; cd $W; }\n");
         s.append(FIELDS_FN);
+        s.append(FETCH_FN);
 
         s.append("\n$BB rm -rf $W/*\n");
         s.append("$BB mkdir -p $P $P/tmp $P/lib\n");
+        // Locate python once, before the loop. It is what fetch() falls back to
+        // and what unpacks a .deb when ar is missing - which is the normal case
+        // on a Quest, whose toybox ships neither ar nor a wget.
+        s.append("PY=\"$(command -v python3 2>/dev/null || true)\"\n");
+        s.append("[ -z \"$PY\" ] && [ -x \"$P/bin/python3\" ] && PY=\"$P/bin/python3\"\n");
+        s.append("ARX=$W/arx.py\n");
+        s.append("if [ -n \"$PY\" ]; then\n");
+        s.append("cat > \"$ARX\" <<'BBAR'\n");
+        s.append(ARX_PY);
+        s.append("BBAR\n");
+        s.append("fi\n");
         s.append("echo '[1/4] fetching the package index'\n");
-        s.append("$BB wget -q -O Packages.gz ").append(INDEX).append('\n');
+        s.append("fetch \"").append(INDEX).append("\" Packages.gz\n");
         s.append("if [ ! -s Packages.gz ]; then\n");
         s.append("  echo '  ! index download failed'\n");
         s.append("  exit 1\n");
@@ -307,7 +388,7 @@ public final class Pkg {
         s.append("  echo \"      $COUNT. $p $VER\"\n");
 
         s.append("  BASE=${FILE##*/}\n");
-        s.append("  if ! $BB wget -q -O \"$BASE\" \"$R/$FILE\"; then\n");
+        s.append("  if ! fetch \"$R/$FILE\" \"$BASE\"; then\n");
         s.append("    echo \"  ! download failed: $p\"; exit 1\n");
         s.append("  fi\n");
         s.append("  if [ -n \"$SHA\" ]; then\n");
@@ -318,12 +399,13 @@ public final class Pkg {
         s.append("  fi\n");
 
         s.append("  $BB rm -rf x && $BB mkdir x && cd x || exit 1\n");
-        // toybox has no ar applet, so a .deb falls back through tar (GNU tar
-        // reads ar archives) and then a busybox copy if one is installed.
+        // toybox has no ar applet, so a .deb falls back through python (which
+        // parses the ar container itself), then tar, then busybox if installed.
         s.append("  if $BB ar x \"../$BASE\" 2>/dev/null; then :\n");
+        s.append("  elif [ -n \"$PY\" ] && [ -f \"$ARX\" ] && \"$PY\" \"$ARX\" \"../$BASE\" 2>/dev/null; then :\n");
         s.append("  elif $BB tar -xf \"../$BASE\" 2>/dev/null; then :\n");
         s.append("  elif command -v busybox >/dev/null 2>&1 && busybox ar x \"../$BASE\" 2>/dev/null; then :\n");
-        s.append("  else echo \"  ! cannot unpack $p: no ar on this device\"; cd $W; exit 1; fi\n");
+        s.append("  else echo \"  ! cannot unpack $p: needs ar, busybox or python3\"; cd $W; exit 1; fi\n");
         s.append("  DATA=$($BB ls data.tar.* 2>/dev/null | $BB head -1)\n");
         s.append("  case \"$DATA\" in\n");
         // Decompress through a pipe rather than tar -J/-z/-I: which of those
@@ -441,9 +523,10 @@ public final class Pkg {
         s.append("W=$P/work\n");
         s.append("$BB mkdir -p $W && cd $W\n");
         s.append(FIELDS_FN);
+        s.append(FETCH_FN);
         s.append("if [ ! -s Packages ]; then\n");
         s.append("  echo '[1/2] fetching the package index'\n");
-        s.append("  $BB wget -q -O Packages.gz ").append(INDEX).append(" || "
+        s.append("  fetch \"").append(INDEX).append("\" Packages.gz || "
                + "{ echo '  ! index download failed'; exit 1; }\n");
         s.append("  $BB gzip -dc Packages.gz > Packages\n");
         s.append("fi\n");
@@ -478,9 +561,10 @@ public final class Pkg {
         s.append("P=").append(PREFIX).append('\n');
         s.append("W=$P/work\n");
         s.append("$BB mkdir -p $W && cd $W\n");
+        s.append(FETCH_FN);
         s.append("if [ ! -s Packages ]; then\n");
         s.append("  echo 'fetching the package index'\n");
-        s.append("  $BB wget -q -O Packages.gz ").append(INDEX).append(" || "
+        s.append("  fetch \"").append(INDEX).append("\" Packages.gz || "
                + "{ echo '  ! index download failed'; exit 1; }\n");
         s.append("  $BB gzip -dc Packages.gz > Packages\n");
         s.append("  $BB rm -f Packages.gz\n");

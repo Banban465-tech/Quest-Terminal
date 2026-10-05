@@ -469,16 +469,13 @@ adbT = new AdbShell(this, device, shCb);
             append("adb client:  not in this build\n");
         }
         append("su:          " + describeSuOnDisk() + "\n");
-        append("\nnothing is running commands yet. shizuku is tried first, then adb:\n\n");
-        append("  1. wireless adb   pairs once with 'adbsetup', then this app\n");
-        append("                    connects on its own at every launch. no root,\n");
-        append("                    no Shizuku.\n");
-        append("  2. su             root via the app's own su. needs a root\n");
-        append("                    manager and one approval tap.\n");
-        append("  3. checkshizuku   Shizuku/ByteZuku, running with Terminal\n");
-        append("                    granted. uid 2000.\n");
 
         if (suWas && suSaved != null) {
+            // Approved on a previous launch, so do not open by demanding
+            // access. The options block used to print first, which meant a
+            // headset that had already said yes was still told "su ... needs a
+            // root manager and one approval tap" seconds before it reported
+            // "root is still granted. uid 0."
             append("\nre-checking the su you granted before...\n");
             new Thread(new Runnable() {
                 public void run() {
@@ -497,6 +494,8 @@ adbT = new AdbShell(this, device, shCb);
                 }
             }).start();
         } else {
+            append("\nnothing is running commands yet. shizuku is tried first, then adb:\n\n");
+            appendConnectOptions();
             // Shizuku first, adb only if that does not come up. The banner used
             // to lead with adb as 'the default', which meant a headset with a
             // working Shizuku grant still went down the pairing path first and
@@ -506,6 +505,21 @@ adbT = new AdbShell(this, device, shCb);
             tryShizukuThenAdb(adbSaved);
             autoConnectAdb(adbSaved);
         }
+    }
+
+    /**
+     * The three ways to get a shell. Printed only when one is genuinely
+     * still needed - never ahead of a su probe that is about to say the
+     * grant is already in place.
+     */
+    private void appendConnectOptions() {
+        append("  1. wireless adb   pairs once with 'adbsetup', then this app\n");
+        append("                    connects on its own at every launch. no root,\n");
+        append("                    no Shizuku.\n");
+        append("  2. su             root via the app's own su. needs a root\n");
+        append("                    manager and one approval tap.\n");
+        append("  3. checkshizuku   Shizuku/ByteZuku, running with Terminal\n");
+        append("                    granted. uid 2000.\n");
     }
 
     /**
@@ -3691,13 +3705,13 @@ sh = s;
      * shown raw rather than guessed at.
      */
     private static final String[][] HEADSETS = {
-        { "eureka",    "Quest 3"    },
-        { "panther",   "Quest 3S"   },
-        { "seacliff",  "Quest Pro"  },
-        { "hollywood", "Quest 2S"   },
-        { "batlleeye", "Quest 2"    },
-        { "vrcausal",  "Quest 1"    },
-        { "aurora",    "Oculus Go"  },
+        { "eureka",    "Quest 3"        },
+        { "panther",   "Quest 3S"       },
+        { "seacliff",  "Quest Pro"      },
+        { "hollywood", "Quest 2"        },
+        { "monterey",  "Quest 1"        },
+        { "pacific",   "Oculus Go"      },
+        { "seiku",     "Quest emulator" },   // does not exist. yet.
     };
 
     private String modelName() {

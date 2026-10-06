@@ -178,12 +178,23 @@ final class Su {
         Probe p = new Probe();
         p.hadBinary = false;
         int tries = 0;
-        for (String path : paths) {
-            if (path == null) continue;
-            if (!new File(path).exists()) continue;
-            p.hadBinary = true;
+        for (int i = 0; i < paths.length; i++) {
+            String path = paths[i];
+            if (path == null || path.length() == 0) continue;
+            boolean statable = new File(path).exists();
+            // candidates() puts the remembered path first and it is always
+            // tried. A shell uid cannot see into /data/adb, so exists()
+            // answers no for a su that runs perfectly, and the walk used to
+            // end here with "no su binary on this device" on a rooted headset.
+            if (!statable && i > 0) continue;
             if (tries++ >= maxTries) { p.note = "stopped after " + maxTries + " su binaries"; break; }
             Result r = run(path, "id -u", null, timeoutMs);
+            if (!statable && r.err != null && r.err.contains("No such file")) {
+                // could not even be exec'd: not there after all
+                p.note = "no su binary on this device";
+                continue;
+            }
+            p.hadBinary = true;
             String a = answer(r);
             p.path = path;
             p.note = a.length() == 0 ? (r.timedOut ? r.err : "no answer") : a;

@@ -485,6 +485,15 @@ adbT = new AdbShell(this, device, shCb);
                             if (p.status == Su.GRANTED) {
                                 adoptRoot(p.path);
                                 append("root is still granted. uid 0.\n");
+                            } else if (suSaved != null && suSaved.length() > 0
+                                    && p.status != Su.REFUSED) {
+                                // saved and not refused outright: a probe that
+                                // timed out or could not be run does not take
+                                // the grant away. a real revocation still does,
+                                // because that is the manager saying no.
+                                append("the re-check did not answer; keeping the saved grant.\n");
+                                adoptRoot(suSaved);
+                                append("root is still granted. uid 0.\n");
                             } else {
                                 append("no longer granted. run 'su' to ask again.\n");
                                 autoConnectAdb(adbSaved);
@@ -642,7 +651,27 @@ adbT = new AdbShell(this, device, shCb);
         t.start();
     }
 
+    /**
+     * The su this app has already been granted, or null when there is nothing
+     * to reuse. A grant is saved the first time it is proved and then trusted:
+     * this uid may not be able to stat the binary (it lives in /data/adb),
+     * which is not the same thing as having no root.
+     */
+    private String savedSu() {
+        if (!pon("suGranted", false)) return null;
+        String p = pget("suPath", null);
+        return (p == null || p.length() == 0) ? null : p;
+    }
+
     private String describeSuOnDisk() {
+        // the saved grant answers the question directly. Su.find() only stats
+        // its own list, so it reported "no su binary on this device" while a
+        // working grant was sitting in prefs.
+        String saved = savedSu();
+        if (saved != null) {
+            String sm = Su.managerFor(saved);
+            return saved + (sm == null ? "" : " (" + sm + ")") + ", granted";
+        }
         String found = Su.find();
         if (found == null) return "no su binary on this device";
         String mgr = Su.managerFor(found);
@@ -4211,7 +4240,13 @@ sh = s;
      * package, which is the entry the user can see and revoke.
      */
     private void doSu(final String arg, final Session s) {
-        startSuProbe(s, arg, 20000, true);
+        // A grant that is already saved answers immediately, so the short
+        // budget is fine and keeps a dead manager from stalling the line.
+        // With no grant yet someone has to notice the prompt and tap it -
+        // in a headset, with the app on the other side of a menu - which is
+        // what askforsu's 60s is for. 20s was cutting that off, so an
+        // ungranted 'su' now asks on the same budget as askforsu.
+        startSuProbe(s, arg, savedSu() != null ? 20000 : 60000, true);
     }
 
     /**
@@ -4228,8 +4263,13 @@ sh = s;
         String mgr = Su.managerFor(pget("suPath", Su.find()));
         final String[] cands = Su.candidates(mgr, pget("suPath", null));
         if (announce) {
-            append("asking " + getPackageName() + " for root...\n");
-            append("approve it in your root manager if a prompt appears.\n");
+            if (savedSu() != null) {
+                // already approved: do not ask the user to go approve it again
+                append("root is already granted for this app, checking it...\n");
+            } else {
+                append("asking " + getPackageName() + " for root...\n");
+                append("approve it in your root manager if a prompt appears.\n");
+            }
         }
         new Thread(new Runnable() {
             public void run() {
@@ -4257,6 +4297,19 @@ sh = s;
         }
 
         if (!p.hadBinary) {
+            // The walk saw nothing stat-able, but this app has already been
+            // granted one and remembered it. The point of remembering is that
+            // the command still happens, so run it rather than report no root.
+            String saved = savedSu();
+            if (saved != null) {
+                append("this uid cannot see the su, but a grant is saved for it.\n");
+                append("  su:      " + saved + "\n");
+                adoptRoot(saved);
+                append("root granted, uid 0 (from the saved grant)\n");
+                if (arg != null && arg.length() > 0) sh.exec(arg);
+                render();
+                return;
+            }
             append("no root on this device - no su binary anywhere.\n");
             append("not a problem. currently: " + transportLine() + "\n");
             append("  'adbsetup' gets a uid 2000 shell with no root at all,\n"

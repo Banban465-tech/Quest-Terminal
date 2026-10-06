@@ -48,7 +48,9 @@ final class Updater {
             String s = label();
             if (s.startsWith("v") || s.startsWith("V")) s = s.substring(1);
             String[] parts = s.split("\\.");
-            if (parts.length == 0 || parts.length > 4) return null;
+            // four was the old cap, which made 1.2.6.3.1 unparseable and
+            // therefore newer than every build including itself
+            if (parts.length == 0 || parts.length > 6) return null;
             int[] v = new int[parts.length];
             for (int i = 0; i < parts.length; i++) {
                 try { v[i] = Integer.parseInt(parts[i].trim()); }

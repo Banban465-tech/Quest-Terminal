@@ -352,6 +352,17 @@ String cwd = "";
 
     private Shell.Callback shCb;
 
+    /**
+     * One connection block per outage, not one per failed retry. Shell
+     * schedules its own retry for every bind failure, and each failure used to
+     * land in onFail and reprint the whole block - which also arms a second
+     * bind, so the loop fed itself. With adb present its connect lines are in
+     * that same block, which is what made it a wall of text instead of a
+     * couple of lines. Cleared whenever a transport comes up, so the next real
+     * outage still gets its help.
+     */
+    private boolean autoHelpShown = false;
+
     // ---------------------------------------------------------------- transports
 
     /** one line naming what is actually running commands, for status and help */
@@ -363,6 +374,7 @@ String cwd = "";
     private void setTransport(Transport t, String note) {
         Transport old = sh;
         sh = t;
+        if (t != null) autoHelpShown = false;
         if (old != null && old != t && old instanceof SuShell) ((SuShell) old).shutdown();
         if (old != null && old != t && old instanceof AdbShell) ((AdbShell) old).shutdown();
         for (Session s : sessions) {
@@ -456,7 +468,20 @@ adbT = new AdbShell(this, device, shCb);
      * keeps in persist.adb.tcp.port. Once this app has paired, adbd trusts the
      * loopback connection and no confirmation prompt is involved.
      */
-    private void appendNoShell() {
+    private void appendNoShell() { appendNoShell(true); }
+
+    /**
+     * @param rearm false when this is being called from onFail. Shell has
+     *        already queued its own retry for a failed bind, and it schedules
+     *        the slow rebind too, so there is nothing here to start. Arming
+     *        work from inside the failure handler is what fed the loop: after
+     *        MAX_RETRIES 'connecting' is false again, so every 8s bind timeout
+     *        re-entered onFail, printed this whole block, and launched the
+     *        next attempt - forever. With adb up, autoConnectAdb rode along in
+     *        the same block, which is what made it a wall of text rather than
+     *        a couple of lines.
+     */
+    private void appendNoShell(boolean rearm) {
         final String suSaved = pget("suPath", null);
         final boolean suWas = pon("suGranted", false);
         final String adbSaved = pget("adbDev", null);
@@ -469,6 +494,14 @@ adbT = new AdbShell(this, device, shCb);
             append("adb client:  not in this build\n");
         }
         append("su:          " + describeSuOnDisk() + "\n");
+
+        if (!rearm) {
+            // Report only. The transport is being retried by Shell already, so
+            // showing the options once is help and starting anything is not.
+            append("\nnothing can run until one of these is up:\n\n");
+            appendConnectOptions();
+            return;
+        }
 
         if (suWas && suSaved != null) {
             // Approved on a previous launch, so do not open by demanding
@@ -693,6 +726,7 @@ public void onReady(Shell s) {
                       return;
                   }
 sh = s;
+                autoHelpShown = false;
                 status.setText("shizuku: connected (uid 2000 shell)");
                 // ask the headset what it is before the prompt needs to say so
                 loadCodename(s);
@@ -715,8 +749,17 @@ sh = s;
                 } else if (why.startsWith("the running shell service")) {
                     append(why + "\n");
                 } else {
+                    // One report per outage, not one per retry cycle. Shell
+                    // retries on its own and the status line at the bottom of
+                    // the window is refreshed above on every failure, so
+                    // nothing is lost by staying quiet - while a line, and
+                    // before this a whole block, every 20s is exactly how a
+                    // retry loop turned into a text wall. adb makes it worse
+                    // because its connect lines ride along in the block.
+                    if (autoHelpShown) return;
+                    autoHelpShown = true;
                     append("shizuku: " + Shell.describeState() + "\n");
-                    appendNoShell();
+                    appendNoShell(false);
                 }
             }
             @Override

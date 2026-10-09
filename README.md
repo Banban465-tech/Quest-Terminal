@@ -50,8 +50,7 @@ want ptrace and `/proc/<pid>/mem`.
 ## Building
 
 You need a JDK, the Android SDK, and the Shizuku API jars. Configuration is
-entirely through environment variables, so nothing machine-specific is in the
-script and no credential is committed:
+entirely through environment variables
 
 | variable | meaning |
 |---|---|
